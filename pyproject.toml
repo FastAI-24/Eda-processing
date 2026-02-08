@@ -1,0 +1,13 @@
+[project]
+name = "house-price-prediction"
+version = "0.1.0"
+description = "아파트 가격 예측 ML 프로젝트 - LightGBM GPU 모델"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "lightgbm>=4.0.0",
+    "numpy>=1.23.5,<2.0",
+    "optuna>=3.5.0",
+    "pandas>=1.5.3,<3.0",
+    "scikit-learn>=1.2.2",
+]
