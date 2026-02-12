@@ -194,6 +194,4 @@ pyrightconfig.json
 *.pkl
 data/
 models/
-checkpoints/
-
-# End of https://www.toptal.com/developers/gitignore/api/linux,python
+checkpoints/# End of https://www.toptal.com/developers/gitignore/api/linux,python
