@@ -41,41 +41,39 @@ from .base import PreprocessingContext, PreprocessingStep
 # Step 0: 취소 거래 필터링
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class FilterCancelledTransactionsStep(PreprocessingStep):
-    """해제사유발생일이 존재하는 행(취소 거래)을 제거합니다."""
+    """해제사유발생일이 존재하는 행(취소 거래)을 제거합니다.
+
+    취소된 거래는 실제 유효한 거래가 아니므로, 학습 전에 제거하여
+    모델이 잘못된 패턴을 학습하지 않도록 합니다.
+    단, 테스트 데이터는 행을 삭제하면 안 되므로 컬럼만 제거합니다.
+    """
 
     @property
     def name(self) -> str:
         return "Step 0: 취소 거래 필터링"
 
     @staticmethod
-    def _filter(df: pd.DataFrame) -> pd.DataFrame:
-        col = "해제사유발생일"
-        if col in df.columns:
-            n_cancelled = df[col].notnull().sum()
-            if n_cancelled > 0:
-                print(f"  취소 거래 {n_cancelled:,}건 발견 → 제거")
-                df = df[df[col].isnull()].copy()
-            else:
-                print("  취소 거래 없음")
-            df = df.drop(columns=[col], errors="ignore")
-        else:
-            print(f"  '{col}' 컬럼 없음 — 건너뜀")
-        return df
+    def _filter(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
+        """취소 거래를 필터링합니다.
 
-    @staticmethod
-    def _drop_column_only(df: pd.DataFrame) -> pd.DataFrame:
-        """테스트 데이터: 취소 거래 행은 유지하고 컬럼만 제거합니다.
-
-        평가 시스템이 전체 테스트 행에 대한 예측을 요구하므로,
-        테스트 데이터에서는 행을 제거하지 않습니다.
+        Args:
+            df: 대상 DataFrame
+            is_train: True면 취소 거래 행 제거, False면 컬럼만 제거
         """
         col = "해제사유발생일"
         if col in df.columns:
             n_cancelled = df[col].notnull().sum()
             if n_cancelled > 0:
-                print(f"  취소 거래 {n_cancelled:,}건 발견 → 행 유지, 컬럼만 제거")
+                print(f"  취소 거래 {n_cancelled:,}건 발견")
+                if is_train:
+                    print("  -> 학습 데이터: 취소 거래 행 제거")
+                    df = df[df[col].isnull()].copy()
+                else:
+                    print("  -> 테스트 데이터: 행 유지 (삭제 안 함)")
             else:
                 print("  취소 거래 없음")
+
+            # 컬럼은 학습/테스트 모두 제거
             df = df.drop(columns=[col], errors="ignore")
         else:
             print(f"  '{col}' 컬럼 없음 — 건너뜀")
@@ -83,8 +81,10 @@ class FilterCancelledTransactionsStep(PreprocessingStep):
 
     def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
         print(f"Before: train={ctx.raw_train_df.shape}, test={ctx.raw_test_df.shape}")
-        ctx.raw_train_df = self._filter(ctx.raw_train_df)
-        ctx.raw_test_df = self._drop_column_only(ctx.raw_test_df)
+        # Train: 행 제거 O
+        ctx.raw_train_df = self._filter(ctx.raw_train_df, is_train=True)
+        # Test: 행 제거 X (컬럼만 제거)
+        ctx.raw_test_df = self._filter(ctx.raw_test_df, is_train=False)
         print(f"After:  train={ctx.raw_train_df.shape}, test={ctx.raw_test_df.shape}")
         return ctx
 
