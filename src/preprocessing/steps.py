@@ -62,10 +62,29 @@ class FilterCancelledTransactionsStep(PreprocessingStep):
             print(f"  '{col}' 컬럼 없음 — 건너뜀")
         return df
 
+    @staticmethod
+    def _drop_column_only(df: pd.DataFrame) -> pd.DataFrame:
+        """테스트 데이터: 취소 거래 행은 유지하고 컬럼만 제거합니다.
+
+        평가 시스템이 전체 테스트 행에 대한 예측을 요구하므로,
+        테스트 데이터에서는 행을 제거하지 않습니다.
+        """
+        col = "해제사유발생일"
+        if col in df.columns:
+            n_cancelled = df[col].notnull().sum()
+            if n_cancelled > 0:
+                print(f"  취소 거래 {n_cancelled:,}건 발견 → 행 유지, 컬럼만 제거")
+            else:
+                print("  취소 거래 없음")
+            df = df.drop(columns=[col], errors="ignore")
+        else:
+            print(f"  '{col}' 컬럼 없음 — 건너뜀")
+        return df
+
     def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
         print(f"Before: train={ctx.raw_train_df.shape}, test={ctx.raw_test_df.shape}")
         ctx.raw_train_df = self._filter(ctx.raw_train_df)
-        ctx.raw_test_df = self._filter(ctx.raw_test_df)
+        ctx.raw_test_df = self._drop_column_only(ctx.raw_test_df)
         print(f"After:  train={ctx.raw_train_df.shape}, test={ctx.raw_test_df.shape}")
         return ctx
 
@@ -236,6 +255,53 @@ class DateAddressFeaturesStep(PreprocessingStep):
         print("  테스트 데이터:")
         ctx.X_test = self._add_features(ctx.X_test)
         print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 3.7: 시간 파생 피처
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class TemporalFeaturesStep(PreprocessingStep):
+    """계약년월에서 세부 시간 피처를 분해하여 계절성/추세를 포착합니다.
+
+    생성 피처:
+        - 계약년: 연도 (2007~2023)
+        - 계약월: 월 (1~12)
+        - 계약분기: 분기 (1~4)
+        - 계약반기: 반기 (1~2)
+        - 계약월_sin, 계약월_cos: 월의 순환 인코딩 (12월→1월 연속성)
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 3.7: 시간 파생 피처"
+
+    @staticmethod
+    def _add_features(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        created: list[str] = []
+
+        if "계약년월" in df.columns:
+            df["계약년"] = (df["계약년월"] // 100).astype("Int64")
+            df["계약월"] = (df["계약년월"] % 100).astype("Int64")
+            df["계약분기"] = ((df["계약월"] - 1) // 3 + 1).astype("Int64")
+            df["계약반기"] = ((df["계약월"] - 1) // 6 + 1).astype("Int64")
+
+            # Cyclical encoding: 12월 → 1월 연속성 유지
+            month_float = df["계약월"].astype("float64")
+            df["계약월_sin"] = np.sin(2 * np.pi * month_float / 12)
+            df["계약월_cos"] = np.cos(2 * np.pi * month_float / 12)
+
+            created.extend(["계약년", "계약월", "계약분기", "계약반기", "계약월_sin", "계약월_cos"])
+
+        print(f"  생성된 시간 피처 ({len(created)}개): {created}")
+        return df
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        print("  학습 데이터:")
+        ctx.X_train = self._add_features(ctx.X_train)
+        print("  테스트 데이터:")
+        ctx.X_test = self._add_features(ctx.X_test)
         return ctx
 
 
@@ -446,6 +512,72 @@ class CoordinateInterpolationStep(PreprocessingStep):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 6.5: 공간 파생 피처 (좌표 → 거리)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class SpatialFeaturesStep(PreprocessingStep):
+    """좌표 기반 공간 피처를 생성합니다.
+
+    보간된 좌표(경도/위도)로부터 서울 주요 랜드마크까지의
+    유클리드 거리를 계산하여 지리적 가격 구배를 포착합니다.
+
+    생성 피처:
+        - dist_강남역: 강남역까지 거리 (km)
+        - dist_서울시청: 서울시청까지 거리 (km)
+        - dist_여의도: 여의도까지 거리 (km)
+    """
+
+    # 주요 랜드마크 좌표 (경도, 위도)
+    LANDMARKS: dict[str, tuple[float, float]] = {
+        "강남역": (127.0276, 37.4979),
+        "서울시청": (126.9780, 37.5665),
+        "여의도": (126.9246, 37.5219),
+    }
+
+    @property
+    def name(self) -> str:
+        return "Step 6.5: 공간 파생 피처"
+
+    @staticmethod
+    def _approx_km_distance(
+        lon1: pd.Series, lat1: pd.Series,
+        lon2: float, lat2: float,
+    ) -> pd.Series:
+        """서울 지역(위도 ~37.5°) 근사 유클리드 거리 (km).
+
+        위도 1° ≈ 111 km, 경도 1° ≈ 88 km (위도 37.5° 기준).
+        """
+        dx = (lon1 - lon2) * 88.0
+        dy = (lat1 - lat2) * 111.0
+        return np.sqrt(dx ** 2 + dy ** 2)
+
+    @classmethod
+    def _add_features(cls, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        created: list[str] = []
+
+        if "좌표X" in df.columns and "좌표Y" in df.columns:
+            lon = df["좌표X"].astype("float64")
+            lat = df["좌표Y"].astype("float64")
+
+            for name, (ref_lon, ref_lat) in cls.LANDMARKS.items():
+                col_name = f"dist_{name}"
+                df[col_name] = cls._approx_km_distance(lon, lat, ref_lon, ref_lat)
+                created.append(col_name)
+                stats = df[col_name].describe()
+                print(f"    {col_name}: mean={stats['mean']:.2f}km, max={stats['max']:.2f}km")
+
+        print(f"  생성된 공간 피처 ({len(created)}개): {created}")
+        return df
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        print("  학습 데이터:")
+        ctx.X_train = self._add_features(ctx.X_train)
+        print("  테스트 데이터:")
+        ctx.X_test = self._add_features(ctx.X_test)
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Step 7: 결측값 대체 (KNN Imputer)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class MissingValueImputerStep(PreprocessingStep):
@@ -604,6 +736,209 @@ class ParkingPerHouseholdStep(PreprocessingStep):
         ctx.X_train = self._add_feature(ctx.X_train)
         print("  테스트 데이터:")
         ctx.X_test = self._add_feature(ctx.X_test)
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 7.7: 교호작용 / 비율 파생 피처
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class InteractionFeaturesStep(PreprocessingStep):
+    """수치형 피처 간 교호작용/비율/변환 피처를 생성합니다.
+
+    트리 모델은 피처 간 곱/나눗셈을 직접 학습하기 어렵기 때문에
+    도메인 지식 기반의 파생 피처를 명시적으로 생성합니다.
+
+    생성 피처:
+        - 면적x층: 전용면적 × 층 (고층 대형 프리미엄)
+        - 면적_건물나이비: 전용면적 / (건물나이+1) (신축 대형의 가치)
+        - log_전용면적: log1p(전용면적) (비선형 면적 효과)
+        - 전용면적_sq: 전용면적² (면적 증가에 따른 가속 가격 상승)
+        - 층_건물나이비: 층 / (건물나이+1) (신축 고층 프리미엄)
+        - 동당세대수: k-전체세대수 / (k-전체동수+1) (단지 밀집도)
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 7.7: 교호작용 피처"
+
+    @staticmethod
+    def _add_features(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        created: list[str] = []
+
+        # 전용면적 × 층 (고층 대형 프리미엄)
+        if "전용면적" in df.columns and "층" in df.columns:
+            area = pd.to_numeric(df["전용면적"], errors="coerce")
+            floor = pd.to_numeric(df["층"], errors="coerce")
+            df["면적x층"] = area * floor
+            created.append("면적x층")
+
+        # 전용면적 / (건물나이 + 1) (신축 대형 가치)
+        if "전용면적" in df.columns and "건물나이" in df.columns:
+            area = pd.to_numeric(df["전용면적"], errors="coerce")
+            age = pd.to_numeric(df["건물나이"], errors="coerce")
+            df["면적_건물나이비"] = area / (age + 1)
+            created.append("면적_건물나이비")
+
+        # log(전용면적 + 1) (비선형 면적 효과)
+        if "전용면적" in df.columns:
+            area = pd.to_numeric(df["전용면적"], errors="coerce")
+            df["log_전용면적"] = np.log1p(area)
+            created.append("log_전용면적")
+
+        # 전용면적² (가속 가격 상승)
+        if "전용면적" in df.columns:
+            area = pd.to_numeric(df["전용면적"], errors="coerce")
+            df["전용면적_sq"] = area ** 2
+            created.append("전용면적_sq")
+
+        # 층 / (건물나이 + 1)
+        if "층" in df.columns and "건물나이" in df.columns:
+            floor = pd.to_numeric(df["층"], errors="coerce")
+            age = pd.to_numeric(df["건물나이"], errors="coerce")
+            df["층_건물나이비"] = floor / (age + 1)
+            created.append("층_건물나이비")
+
+        # 동당 세대수 (단지 밀집도)
+        if "k-전체세대수" in df.columns and "k-전체동수" in df.columns:
+            household = pd.to_numeric(df["k-전체세대수"], errors="coerce").fillna(0)
+            buildings = pd.to_numeric(df["k-전체동수"], errors="coerce").fillna(0)
+            df["동당세대수"] = household / (buildings + 1)
+            created.append("동당세대수")
+
+        # inf / NaN 안전 처리
+        for col in created:
+            df[col] = df[col].replace([np.inf, -np.inf], np.nan).fillna(0)
+
+        print(f"  생성된 교호작용 피처 ({len(created)}개): {created}")
+        return df
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        print("  학습 데이터:")
+        ctx.X_train = self._add_features(ctx.X_train)
+        print("  테스트 데이터:")
+        ctx.X_test = self._add_features(ctx.X_test)
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 7.8: Bayesian Smoothed Target Encoding
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class TargetEncodingStep(PreprocessingStep):
+    """고카디널리티 범주형 피처를 Bayesian Smoothed Target Encoding합니다.
+
+    LightGBM의 native categorical 처리는 고유값 20,000+인 피처에서
+    효율이 떨어질 수 있습니다. Target Encoding으로 가격 신호를
+    직접적인 수치형 피처로 변환합니다.
+
+    인코딩 공식 (Bayesian Smoothing):
+        te_value = (count × group_mean + α × global_mean) / (count + α)
+
+        - count: 해당 범주의 학습 데이터 건수
+        - group_mean: 해당 범주의 log1p(target) 평균
+        - global_mean: 전체 학습 데이터의 log1p(target) 평균
+        - α (smoothing): 사전 분포 강도 (건수가 적을수록 전역 평균에 수렴)
+
+    데이터 누수 방지:
+        - 학습 데이터에서 encoding map 생성
+        - 테스트 데이터에는 학습 기준 map 적용
+        - 테스트에 없는 범주 → 전역 평균 대체
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 7.8: Target Encoding"
+
+    @staticmethod
+    def _encode(
+        X_train: pd.DataFrame,
+        X_test: pd.DataFrame,
+        y_train: pd.Series,
+        target_encode_cols: list[str],
+        smoothing: int = 100,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+        """Bayesian Smoothed Target Encoding을 수행합니다.
+
+        log1p(target) 공간에서 인코딩하여 스케일 왜곡을 방지합니다.
+        """
+        X_train = X_train.copy()
+        X_test = X_test.copy()
+        encoding_maps: dict[str, dict] = {}
+        created: list[str] = []
+
+        # log1p 공간에서 인코딩 (모델이 log 타겟을 학습하므로)
+        y_log = np.log1p(y_train.values)
+        global_mean = float(np.mean(y_log))
+
+        for col in target_encode_cols:
+            if col not in X_train.columns:
+                print(f"    {col}: 컬럼 없음 — 건너뜀")
+                continue
+
+            # 그룹별 통계 계산
+            tmp = pd.DataFrame({"key": X_train[col].astype(str), "y": y_log})
+            group_stats = tmp.groupby("key")["y"].agg(["mean", "count"])
+
+            # Bayesian Smoothed Mean
+            smoothed = (
+                group_stats["count"] * group_stats["mean"]
+                + smoothing * global_mean
+            ) / (group_stats["count"] + smoothing)
+
+            encoding_map = smoothed.to_dict()
+            encoding_maps[col] = {"map": encoding_map, "global_mean": global_mean}
+
+            # 인코딩 적용
+            new_col = f"te_{col}"
+            X_train[new_col] = (
+                X_train[col].astype(str).map(encoding_map).fillna(global_mean)
+            )
+            X_test[new_col] = (
+                X_test[col].astype(str).map(encoding_map).fillna(global_mean)
+            )
+            created.append(new_col)
+
+            train_nunique = X_train[col].nunique()
+            test_coverage = X_test[col].astype(str).isin(encoding_map).mean()
+            print(
+                f"    {new_col}: 학습 고유값={train_nunique:,}, "
+                f"테스트 커버리지={test_coverage:.1%}"
+            )
+
+        # 빈도 인코딩 (거래 건수 = 인기 지표)
+        for col in target_encode_cols:
+            if col not in X_train.columns:
+                continue
+            freq_col = f"freq_{col}"
+            freq_map = X_train[col].astype(str).value_counts().to_dict()
+            X_train[freq_col] = X_train[col].astype(str).map(freq_map).fillna(0).astype("float64")
+            X_test[freq_col] = X_test[col].astype(str).map(freq_map).fillna(0).astype("float64")
+            created.append(freq_col)
+            encoding_maps[f"freq_{col}"] = freq_map
+
+        print(f"  총 생성 피처: {len(created)}개")
+        return X_train, X_test, encoding_maps
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        cfg = ctx.config
+        te_cols = getattr(cfg, "target_encode_cols", [
+            "아파트명", "도로명", "번지", "시군구", "구", "동",
+        ])
+        te_smoothing = getattr(cfg, "target_encode_smoothing", 100)
+
+        print(f"  대상 컬럼 ({len(te_cols)}개): {te_cols}")
+        print(f"  Smoothing factor: {te_smoothing}")
+
+        ctx.X_train, ctx.X_test, te_maps = self._encode(
+            ctx.X_train,
+            ctx.X_test,
+            ctx.y_train,
+            te_cols,
+            smoothing=te_smoothing,
+        )
+        ctx.train_stats["target_encoding_maps"] = te_maps
         print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
         return ctx
 

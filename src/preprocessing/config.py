@@ -95,6 +95,14 @@ class PreprocessingConfig:
         ]
     )
 
+    # ── Target Encoding ──
+    target_encode_cols: list[str] = field(
+        default_factory=lambda: [
+            "아파트명", "도로명", "번지", "시군구", "구", "동",
+        ]
+    )
+    target_encode_smoothing: int = 100
+
     # ── Kakao API ──
     kakao_api_key: str = field(default_factory=lambda: os.environ.get("KAKAO_API_KEY", ""))
     kakao_delay_sec: float = 0.15

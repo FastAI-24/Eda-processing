@@ -36,14 +36,18 @@ from .steps import (
     FilterCancelledTransactionsStep,
     FloatToIntConversionStep,
     IdentifyCategoricalColumnsStep,
+    InteractionFeaturesStep,
     MissingIndicatorStep,
     MissingValueImputerStep,
     OutlierClippingStep,
     ParkingPerHouseholdStep,
     RemoveHighMissingColumnsStep,
     SanitizeColumnNamesStep,
+    SpatialFeaturesStep,
+    TargetEncodingStep,
     TargetLogTransformStep,
     TargetSeparationStep,
+    TemporalFeaturesStep,
 )
 
 
@@ -158,7 +162,7 @@ class PreprocessingPipeline:
     def create_default(
         cls, config: PreprocessingConfig | None = None,
     ) -> "PreprocessingPipeline":
-        """노트북과 동일한 순서의 기본 파이프라인을 생성합니다.
+        """최적화된 기본 파이프라인을 생성합니다.
 
         Pipeline:
             Step 0   → 취소 거래 필터링
@@ -167,11 +171,15 @@ class PreprocessingPipeline:
             Step 2.5 → Float→Int64 타입 변환
             Step 3   → 컬럼명 정리
             Step 3.5 → 날짜/주소 파생 피처
+            Step 3.7 → 시간 파생 피처 (계약년/월/분기/반기 + cyclical)
             Step 4   → 범주형 컬럼 식별
             Step 5   → 결측 지표 피처
             Step 6   → 좌표 보간
+            Step 6.5 → 공간 파생 피처 (랜드마크 거리)
             Step 7   → 결측값 대체 (KNN Imputer)
             Step 7.5 → 세대당 주차대수
+            Step 7.7 → 교호작용 피처 (면적×층, 비율 등)
+            Step 7.8 → Target Encoding (Bayesian Smoothed)
             Step 8   → 이상치 클리핑
             Step 9   → Target 로그 변환
         """
@@ -182,11 +190,15 @@ class PreprocessingPipeline:
         pipeline.add_step(FloatToIntConversionStep())
         pipeline.add_step(SanitizeColumnNamesStep())
         pipeline.add_step(DateAddressFeaturesStep())
+        pipeline.add_step(TemporalFeaturesStep())            # NEW: 시간 피처
         pipeline.add_step(IdentifyCategoricalColumnsStep())
         pipeline.add_step(MissingIndicatorStep())
         pipeline.add_step(CoordinateInterpolationStep())
+        pipeline.add_step(SpatialFeaturesStep())              # NEW: 공간 피처
         pipeline.add_step(MissingValueImputerStep())
         pipeline.add_step(ParkingPerHouseholdStep())
+        pipeline.add_step(InteractionFeaturesStep())           # NEW: 교호작용 피처
+        pipeline.add_step(TargetEncodingStep())                # NEW: 타겟 인코딩
         pipeline.add_step(OutlierClippingStep())
         pipeline.add_step(TargetLogTransformStep())
         return pipeline
