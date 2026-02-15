@@ -81,6 +81,7 @@ class BaseModel(ABC):
         X_val: pd.DataFrame | None = None,
         y_val: pd.Series | np.ndarray | None = None,
         categorical_features: list[str] | None = None,
+        sample_weight: np.ndarray | None = None,
     ) -> Any:
         """모델을 학습합니다.
 
@@ -90,6 +91,7 @@ class BaseModel(ABC):
             X_val: 검증 피처 (early stopping용)
             y_val: 검증 타겟
             categorical_features: 범주형 피처 목록
+            sample_weight: 샘플 가중치 (시간 기반 등)
 
         Returns:
             학습된 모델 객체

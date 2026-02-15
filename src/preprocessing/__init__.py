@@ -30,6 +30,7 @@ from .steps import (
     FloatToIntConversionStep,
     IdentifyCategoricalColumnsStep,
     InteractionFeaturesStep,
+    LowImportanceFeatureRemovalStep,
     MissingIndicatorStep,
     MissingValueImputerStep,
     OutlierClippingStep,
@@ -41,6 +42,7 @@ from .steps import (
     TargetLogTransformStep,
     TargetSeparationStep,
     TemporalFeaturesStep,
+    TransitFeaturesStep,
 )
 
 __all__ = [
@@ -61,11 +63,13 @@ __all__ = [
     "MissingIndicatorStep",
     "CoordinateInterpolationStep",
     "SpatialFeaturesStep",
+    "TransitFeaturesStep",
     "MissingValueImputerStep",
     "ParkingPerHouseholdStep",
     "InteractionFeaturesStep",
     "TargetEncodingStep",
     "OutlierClippingStep",
+    "LowImportanceFeatureRemovalStep",
     "TargetLogTransformStep",
     "create_submission",
     "create_baseline_submission",

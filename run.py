@@ -12,10 +12,11 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from preprocessing.run_preprocessing import main  # noqa: E402
 
 # src/ 를 모듈 검색 경로에 추가
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
+from preprocessing.run_preprocessing import main  # noqa: E402
 
 
 

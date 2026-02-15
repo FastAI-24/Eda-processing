@@ -37,6 +37,7 @@ from .steps import (
     FloatToIntConversionStep,
     IdentifyCategoricalColumnsStep,
     InteractionFeaturesStep,
+    LowImportanceFeatureRemovalStep,
     MissingIndicatorStep,
     MissingValueImputerStep,
     OutlierClippingStep,
@@ -48,6 +49,7 @@ from .steps import (
     TargetLogTransformStep,
     TargetSeparationStep,
     TemporalFeaturesStep,
+    TransitFeaturesStep,
 )
 
 
@@ -176,11 +178,13 @@ class PreprocessingPipeline:
             Step 5   → 결측 지표 피처
             Step 6   → 좌표 보간
             Step 6.5 → 공간 파생 피처 (랜드마크 거리)
+            Step 6.7 → 버스/지하철 거리 피처 (BallTree)
             Step 7   → 결측값 대체 (KNN Imputer)
             Step 7.5 → 세대당 주차대수
             Step 7.7 → 교호작용 피처 (면적×층, 비율 등)
             Step 7.8 → Target Encoding (Bayesian Smoothed)
             Step 8   → 이상치 클리핑
+            Step 8.5 → 저중요도 피처 제거
             Step 9   → Target 로그 변환
         """
         pipeline = cls(config=config)
@@ -195,10 +199,13 @@ class PreprocessingPipeline:
         pipeline.add_step(MissingIndicatorStep())
         pipeline.add_step(CoordinateInterpolationStep())
         pipeline.add_step(SpatialFeaturesStep())              # NEW: 공간 피처
+        pipeline.add_step(TransitFeaturesStep())              # NEW: 버스/지하철 피처
         pipeline.add_step(MissingValueImputerStep())
         pipeline.add_step(ParkingPerHouseholdStep())
         pipeline.add_step(InteractionFeaturesStep())           # NEW: 교호작용 피처
-        pipeline.add_step(TargetEncodingStep())                # NEW: 타겟 인코딩
+        # TargetEncodingStep은 CV 누수 방지를 위해 전처리에서 제거됨.
+        # trainer.py에서 각 Fold 내부에서 TE를 수행합니다.
         pipeline.add_step(OutlierClippingStep())
+        pipeline.add_step(LowImportanceFeatureRemovalStep())  # NEW: 저중요도 제거
         pipeline.add_step(TargetLogTransformStep())
         return pipeline

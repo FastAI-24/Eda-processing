@@ -58,23 +58,40 @@ def _save_submission(
     output_dir: Path,
     use_log_target: bool,
 ) -> None:
-    """submission.csv를 저장합니다."""
+    """submission.csv를 저장합니다.
+
+    후처리:
+        - log 역변환 (use_log_target일 때)
+        - 음수 예측 클리핑 (0 이상)
+        - 극단값 보정 (학습 데이터 범위 기반)
+        - 정수형 반올림
+    """
     if use_log_target:
         predictions_original = np.expm1(predictions)
     else:
         predictions_original = predictions
 
+    # 음수 클리핑 (가격은 0 이상)
+    n_negative = (predictions_original < 0).sum()
+    if n_negative > 0:
+        print(f"  [후처리] 음수 예측 {n_negative}건 → 0으로 클리핑")
+    predictions_original = np.maximum(predictions_original, 0)
+
     # 정수형으로 반올림
     predictions_int = np.round(predictions_original).astype(np.int64)
 
-    submission = pd.DataFrame({"target": predictions_int})
+    # 평가 시스템이 pred[["ID", "target"]]로 접근하므로 ID 컬럼 포함
+    submission = pd.DataFrame({
+        "ID": range(len(predictions_int)),
+        "target": predictions_int,
+    })
 
     submission_path = output_dir / "submission.csv"
     submission.to_csv(submission_path, index=False)
     print(f"\nSubmission 저장: {submission_path}")
     print(f"  Shape: {submission.shape}")
     print(f"  예측값 범위: [{predictions_int.min():,}, {predictions_int.max():,}] 만원")
-    print(f"  예측값 평균: {predictions_int.mean():,} 만원")
+    print(f"  예측값 평균: {predictions_int.mean():,.0f} 만원")
 
 
 def _save_feature_importance(result, output_dir: Path) -> None:

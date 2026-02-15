@@ -578,6 +578,236 @@ class SpatialFeaturesStep(PreprocessingStep):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 6.7: 버스/지하철 거리 피처
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class TransitFeaturesStep(PreprocessingStep):
+    """버스 정류소/지하철역까지 거리 기반 피처를 생성합니다.
+
+    BallTree를 사용하여 효율적으로 최근접 정류소/역을 탐색합니다.
+    좌표가 실제값인지 보간값인지를 is_real_coord 플래그로 구분합니다.
+
+    생성 피처:
+        - nearest_subway_dist: 가장 가까운 지하철역 거리 (km)
+        - subway_count_1km: 반경 1km 내 지하철역 수
+        - subway_lines_1km: 반경 1km 내 지하철 호선 수
+        - nearest_bus_dist: 가장 가까운 버스정류소 거리 (km)
+        - bus_count_500m: 반경 500m 내 버스정류소 수
+        - is_real_coord: 좌표가 실제값(1)인지 보간값(0)인지 플래그
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 6.7: 버스/지하철 거리 피처"
+
+    @staticmethod
+    def _load_transit_data(
+        data_dir: str | os.PathLike,
+        bus_file: str,
+        subway_file: str,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, pd.DataFrame | None]:
+        """버스/지하철 데이터를 로드합니다.
+
+        Returns:
+            (bus_coords_rad, subway_coords_rad, subway_df)
+            coords_rad는 BallTree용 라디안 좌표 [lat, lon]
+        """
+        from pathlib import Path
+
+        data_path = Path(data_dir)
+        bus_coords = None
+        subway_coords = None
+        subway_df = None
+
+        # 버스 정류소
+        bus_path = data_path / bus_file
+        if bus_path.exists():
+            bus_df = pd.read_csv(bus_path)
+            # 좌표 컬럼명 자동 탐지 (X좌표/경도, Y좌표/위도)
+            x_col = next((c for c in bus_df.columns if "X" in c.upper() or "경도" in c), None)
+            y_col = next((c for c in bus_df.columns if "Y" in c.upper() or "위도" in c), None)
+            if x_col and y_col:
+                valid = bus_df[[x_col, y_col]].dropna()
+                bus_coords = np.radians(valid[[y_col, x_col]].values)
+                print(f"    버스 정류소 로드: {len(valid):,}개")
+        else:
+            print(f"    [WARN] 버스 데이터 없음: {bus_path}")
+
+        # 지하철역
+        subway_path = data_path / subway_file
+        if subway_path.exists():
+            subway_df = pd.read_csv(subway_path)
+            # 좌표 컬럼명 자동 탐지
+            lon_col = next((c for c in subway_df.columns if "경도" in c or "X" in c.upper()), None)
+            lat_col = next((c for c in subway_df.columns if "위도" in c or "Y" in c.upper()), None)
+            if lon_col and lat_col:
+                valid_idx = subway_df[[lon_col, lat_col]].dropna().index
+                subway_df = subway_df.loc[valid_idx].copy()
+                subway_coords = np.radians(subway_df[[lat_col, lon_col]].values)
+                print(f"    지하철역 로드: {len(subway_df):,}개")
+        else:
+            print(f"    [WARN] 지하철 데이터 없음: {subway_path}")
+
+        return bus_coords, subway_coords, subway_df
+
+    @staticmethod
+    def _compute_features(
+        df: pd.DataFrame,
+        bus_coords_rad: np.ndarray | None,
+        subway_coords_rad: np.ndarray | None,
+        subway_df: pd.DataFrame | None,
+        bus_radius_m: float,
+        subway_radius_m: float,
+        coord_was_missing: pd.Series | None = None,
+        chunk_size: int = 50_000,
+    ) -> pd.DataFrame:
+        """BallTree로 거리 피처를 계산합니다 (청크 단위 처리)."""
+        from sklearn.neighbors import BallTree
+
+        df = df.copy()
+        created: list[str] = []
+        EARTH_RADIUS_KM = 6371.0
+        n = len(df)
+
+        if "좌표X" not in df.columns or "좌표Y" not in df.columns:
+            print("    좌표 컬럼 없음 — 건너뜀")
+            return df
+
+        lon = df["좌표X"].astype("float64").values
+        lat = df["좌표Y"].astype("float64").values
+        query_rad = np.radians(np.column_stack([lat, lon]))
+
+        # ── 지하철 피처 (청크 처리) ──
+        if subway_coords_rad is not None and len(subway_coords_rad) > 0:
+            tree = BallTree(subway_coords_rad, metric="haversine")
+            radius_rad = subway_radius_m / (EARTH_RADIUS_KM * 1000)
+
+            nearest_dist = np.zeros(n, dtype="float64")
+            count_arr = np.zeros(n, dtype="int32")
+
+            # 호선 수 계산용
+            line_col = next(
+                (c for c in (subway_df.columns if subway_df is not None else [])
+                 if "호선" in c or "line" in c.lower()),
+                None,
+            )
+            line_arr = np.zeros(n, dtype="int32") if line_col else None
+            line_values = subway_df[line_col].values if (line_col and subway_df is not None) else None
+
+            n_chunks = (n + chunk_size - 1) // chunk_size
+            for i in range(n_chunks):
+                s, e = i * chunk_size, min((i + 1) * chunk_size, n)
+                chunk_q = query_rad[s:e]
+
+                dist, _ = tree.query(chunk_q, k=1)
+                nearest_dist[s:e] = dist.flatten() * EARTH_RADIUS_KM
+
+                counts = tree.query_radius(chunk_q, r=radius_rad, count_only=True)
+                count_arr[s:e] = counts
+
+                if line_values is not None:
+                    indices = tree.query_radius(chunk_q, r=radius_rad)
+                    for j, idx_list in enumerate(indices):
+                        if len(idx_list) > 0:
+                            line_arr[s + j] = len(set(line_values[idx_list]))
+
+                if (i + 1) % 5 == 0 or i == n_chunks - 1:
+                    print(f"    지하철 피처: {e:,}/{n:,} ({100 * e / n:.0f}%)")
+
+            df["nearest_subway_dist"] = nearest_dist
+            created.append("nearest_subway_dist")
+            df["subway_count_1km"] = count_arr
+            created.append("subway_count_1km")
+            if line_arr is not None:
+                df["subway_lines_1km"] = line_arr
+                created.append("subway_lines_1km")
+
+        # ── 버스 피처 (청크 처리) ──
+        if bus_coords_rad is not None and len(bus_coords_rad) > 0:
+            tree = BallTree(bus_coords_rad, metric="haversine")
+            radius_rad = bus_radius_m / (EARTH_RADIUS_KM * 1000)
+
+            nearest_dist = np.zeros(n, dtype="float64")
+            count_arr = np.zeros(n, dtype="int32")
+
+            n_chunks = (n + chunk_size - 1) // chunk_size
+            for i in range(n_chunks):
+                s, e = i * chunk_size, min((i + 1) * chunk_size, n)
+                chunk_q = query_rad[s:e]
+
+                dist, _ = tree.query(chunk_q, k=1)
+                nearest_dist[s:e] = dist.flatten() * EARTH_RADIUS_KM
+
+                counts = tree.query_radius(chunk_q, r=radius_rad, count_only=True)
+                count_arr[s:e] = counts
+
+                if (i + 1) % 5 == 0 or i == n_chunks - 1:
+                    print(f"    버스 피처: {e:,}/{n:,} ({100 * e / n:.0f}%)")
+
+            df["nearest_bus_dist"] = nearest_dist
+            created.append("nearest_bus_dist")
+            df["bus_count_500m"] = count_arr
+            created.append("bus_count_500m")
+
+        # ── is_real_coord 플래그 ──
+        if coord_was_missing is not None:
+            df["is_real_coord"] = (~coord_was_missing).astype("int8")
+            created.append("is_real_coord")
+
+        # NaN 안전 처리
+        for col in created:
+            df[col] = df[col].fillna(0)
+
+        print(f"    생성된 교통 피처 ({len(created)}개): {created}")
+        return df
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        cfg = ctx.config
+
+        # 좌표 보간 전 결측 여부 기록 (is_real_coord 플래그용)
+        # 좌표 보간은 Step 6에서 이미 완료됨 → train_stats에서 복원
+        train_coord_missing = None
+        test_coord_missing = None
+        if "좌표X" in ctx.X_train.columns:
+            # 보간 후이므로 NaN이면 보간도 실패한 것
+            # 대부분은 보간으로 채워짐 → 원본 결측 여부는 missing_count로 간접 추정
+            # 더 정확하게는 coord_group_means 존재 여부로 판단
+            # 여기서는 남아있는 NaN만 체크 (보간 실패 건)
+            train_coord_missing = ctx.X_train["좌표X"].isna()
+            test_coord_missing = ctx.X_test["좌표X"].isna()
+
+        # 데이터 로드
+        print("  교통 데이터 로드:")
+        bus_coords, subway_coords, subway_df = self._load_transit_data(
+            cfg.data_dir,
+            cfg.bus_feature_file,
+            cfg.subway_feature_file,
+        )
+
+        if bus_coords is None and subway_coords is None:
+            print("  [WARN] 버스/지하철 데이터 모두 없음 — 건너뜀")
+            return ctx
+
+        # 학습 데이터
+        print("  학습 데이터:")
+        ctx.X_train = self._compute_features(
+            ctx.X_train, bus_coords, subway_coords, subway_df,
+            cfg.transit_bus_radius_m, cfg.transit_subway_radius_m,
+            train_coord_missing,
+        )
+
+        # 테스트 데이터
+        print("  테스트 데이터:")
+        ctx.X_test = self._compute_features(
+            ctx.X_test, bus_coords, subway_coords, subway_df,
+            cfg.transit_bus_radius_m, cfg.transit_subway_radius_m,
+            test_coord_missing,
+        )
+
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Step 7: 결측값 대체 (KNN Imputer)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class MissingValueImputerStep(PreprocessingStep):
@@ -594,12 +824,17 @@ class MissingValueImputerStep(PreprocessingStep):
         n_neighbors: int = 5,
         sample_size: int = 30_000,
         chunk_size: int = 50_000,
-        fitted_imputer: KNNImputer | None = None,
+        fitted_medians: dict | None = None,
         numeric_cols_order: list[str] | None = None,
-    ) -> tuple[pd.DataFrame, KNNImputer | None, list[str] | None]:
+    ) -> tuple[pd.DataFrame, dict | None, list[str] | None]:
+        """결측값 처리: 범주형→'미상', 수치형→중앙값 대체.
+
+        트리 기반 모델(LightGBM, XGBoost, CatBoost)은 결측값을 자체 처리하지만,
+        일부 파생 피처 계산 시 NaN이 전파되므로 중앙값으로 빠르게 대체합니다.
+        """
         df = df.copy()
 
-        # 1) 범주형 → '미상' (문자열 dtype만, 숫자형 범주는 KNN으로 처리)
+        # 1) 범주형 → '미상' (문자열 dtype만, 숫자형 범주는 median으로 처리)
         cat_filled = 0
         for col in categorical_cols:
             if col in df.columns and df[col].dtype == object:
@@ -609,7 +844,7 @@ class MissingValueImputerStep(PreprocessingStep):
                     cat_filled += n_na
         print(f"  범주형 결측 대체: {cat_filled:,}건 → '미상' (문자열 dtype만)")
 
-        # 2) 수치형 → KNN Imputer
+        # 2) 수치형 → 중앙값(Median) 대체
         if numeric_cols_order is not None:
             num_cols = [c for c in numeric_cols_order if c in df.columns]
         else:
@@ -618,79 +853,60 @@ class MissingValueImputerStep(PreprocessingStep):
                 if c not in categorical_cols
             ]
 
-        # Nullable Int64 → float64 변환 (pd.NA → np.nan, sklearn 호환)
+        # Nullable Int64 → float64 변환 (pd.NA → np.nan)
         for col in num_cols:
             if hasattr(df[col], "dtype") and str(df[col].dtype) in ("Int8", "Int16", "Int32", "Int64"):
                 df[col] = df[col].astype("float64")
 
         total_na = df[num_cols].isna().sum().sum()
         if total_na == 0:
-            print("  수치형 결측 없음 — KNN 건너뜀")
-            return df, fitted_imputer, num_cols
+            print("  수치형 결측 없음 — 건너뜀")
+            return df, fitted_medians, num_cols
 
-        print(f"  수치형 결측: {total_na:,}건 → KNN Imputer (k={n_neighbors})")
-
-        # 완전 행 분리 (성능 최적화)
-        has_na = df[num_cols].isna().any(axis=1)
-        df_clean = df.loc[~has_na].copy()
-        df_dirty = df.loc[has_na].copy()
-        print(f"  완전 행: {len(df_clean):,} / 결측 행: {len(df_dirty):,}")
-
-        if len(df_dirty) == 0:
-            return df, fitted_imputer, num_cols
+        print(f"  수치형 결측: {total_na:,}건 → Median Imputer")
 
         # Fit (학습 데이터에서만)
-        if fitted_imputer is None:
-            imputer = KNNImputer(n_neighbors=n_neighbors, weights="distance")
-            fit_data = df[num_cols].dropna()
-            if len(fit_data) > sample_size:
-                fit_data = fit_data.sample(sample_size, random_state=42)
-            print(f"  KNN fit 샘플: {len(fit_data):,}건")
-            imputer.fit(fit_data)
+        if fitted_medians is None:
+            medians = {}
+            for col in num_cols:
+                med = df[col].median()
+                medians[col] = med
+            print(f"  Median 계산 완료: {len(medians)}개 컬럼")
         else:
-            imputer = fitted_imputer
+            medians = fitted_medians
 
-        # Transform (청크 단위)
-        dirty_vals = df_dirty[num_cols].values
-        result_chunks = []
-        n_chunks = (len(dirty_vals) + chunk_size - 1) // chunk_size
-        for i in tqdm(range(n_chunks), desc="KNN 변환", leave=False):
-            start = i * chunk_size
-            end = min(start + chunk_size, len(dirty_vals))
-            chunk = imputer.transform(dirty_vals[start:end])
-            result_chunks.append(chunk)
-
-        imputed = np.vstack(result_chunks)
-        df.loc[has_na, num_cols] = imputed
+        # Transform
+        filled_count = 0
+        for col in num_cols:
+            n_na = df[col].isna().sum()
+            if n_na > 0 and col in medians:
+                df[col] = df[col].fillna(medians[col])
+                filled_count += n_na
 
         remaining_na = df[num_cols].isna().sum().sum()
-        print(f"  KNN 완료 — 잔여 결측: {remaining_na:,}건")
+        print(f"  Median 완료 — 대체: {filled_count:,}건, 잔여 결측: {remaining_na:,}건")
 
-        return df, imputer, num_cols
+        return df, medians, num_cols
 
     def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
         cfg = ctx.config
 
         # 학습 데이터
         print("  학습 데이터:")
-        ctx.X_train, knn_imp, knn_cols = self._handle_missing(
+        ctx.X_train, medians, num_cols = self._handle_missing(
             ctx.X_train,
             ctx.categorical_cols,
-            n_neighbors=cfg.knn_n_neighbors,
-            sample_size=cfg.knn_sample_size,
-            chunk_size=cfg.knn_chunk_size,
         )
-        ctx.train_stats["knn_imputer"] = knn_imp
-        ctx.train_stats["knn_numeric_cols"] = knn_cols
+        ctx.train_stats["median_values"] = medians
+        ctx.train_stats["median_numeric_cols"] = num_cols
 
-        # 테스트 데이터 (학습 기준 imputer 재사용)
-        print("\n  테스트 데이터 (학습 기준 KNN):")
+        # 테스트 데이터 (학습 기준 median 재사용)
+        print("\n  테스트 데이터 (학습 기준 Median):")
         ctx.X_test, _, _ = self._handle_missing(
             ctx.X_test,
             ctx.categorical_cols,
-            fitted_imputer=ctx.train_stats.get("knn_imputer"),
-            numeric_cols_order=ctx.train_stats.get("knn_numeric_cols"),
-            chunk_size=cfg.knn_chunk_size,
+            fitted_medians=ctx.train_stats.get("median_values"),
+            numeric_cols_order=ctx.train_stats.get("median_numeric_cols"),
         )
         return ctx
 
@@ -1041,4 +1257,41 @@ class TargetLogTransformStep(PreprocessingStep):
         y_restored = self.inverse_transform(ctx.y_train_log.values)
         max_error = np.max(np.abs(ctx.y_train.values - y_restored))
         print(f"  역변환 최대 오차: {max_error:.10f}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 8.5: 저중요도 피처 제거
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class LowImportanceFeatureRemovalStep(PreprocessingStep):
+    """피처 중요도가 극히 낮은 컬럼을 제거하여 노이즈를 줄입니다.
+
+    이전 학습 결과의 feature importance에서 중요도 < 50인 피처들을 제거합니다.
+    config.low_importance_cols에 제거 대상 리스트가 관리됩니다.
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 8.5: 저중요도 피처 제거"
+
+    @staticmethod
+    def _remove(df: pd.DataFrame, cols_to_remove: list[str]) -> pd.DataFrame:
+        existing = [c for c in cols_to_remove if c in df.columns]
+        if existing:
+            df = df.drop(columns=existing, errors="ignore")
+            print(f"    제거된 컬럼 ({len(existing)}개): {existing}")
+        else:
+            print("    제거할 컬럼 없음")
+        return df
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        cols = ctx.config.low_importance_cols
+        print(f"  제거 대상: {len(cols)}개")
+        print("  학습 데이터:")
+        ctx.X_train = self._remove(ctx.X_train, cols)
+        print("  테스트 데이터:")
+        ctx.X_test = self._remove(ctx.X_test, cols)
+        # 범주형 목록에서도 제거
+        ctx.categorical_cols = [c for c in ctx.categorical_cols if c not in cols]
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
         return ctx
