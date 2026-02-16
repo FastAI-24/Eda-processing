@@ -27,6 +27,7 @@ K-Fold 교차 검증과 RMSE 평가를 수행하는 핵심 모듈입니다.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -39,8 +40,46 @@ from .config import ModelConfig
 
 
 # ─────────────────────────────────────────────────────────────
-# Fold 내 Target Encoding 유틸리티
+# Fold 내 Target Encoding 유틸리티 (컬럼별 병렬 처리)
 # ─────────────────────────────────────────────────────────────
+def _encode_single_column(
+    col: str,
+    train_col_str: pd.Series,
+    val_col_str: pd.Series,
+    test_col_str: pd.Series | None,
+    y_train_fold: np.ndarray,
+    global_mean: float,
+    smoothing: int,
+) -> dict[str, pd.Series]:
+    """단일 컬럼에 대해 TE + Freq 인코딩을 수행합니다 (병렬 호출용)."""
+    result: dict[str, pd.Series] = {}
+
+    # Bayesian Smoothed Mean
+    tmp = pd.DataFrame({"key": train_col_str, "y": y_train_fold})
+    group_stats = tmp.groupby("key")["y"].agg(["mean", "count"])
+    smoothed = (
+        group_stats["count"] * group_stats["mean"]
+        + smoothing * global_mean
+    ) / (group_stats["count"] + smoothing)
+    encoding_map = smoothed.to_dict()
+
+    te_col = f"te_{col}"
+    result[f"train_{te_col}"] = train_col_str.map(encoding_map).fillna(global_mean)
+    result[f"val_{te_col}"] = val_col_str.map(encoding_map).fillna(global_mean)
+    if test_col_str is not None:
+        result[f"test_{te_col}"] = test_col_str.map(encoding_map).fillna(global_mean)
+
+    # 빈도 인코딩
+    freq_col = f"freq_{col}"
+    freq_map = train_col_str.value_counts().to_dict()
+    result[f"train_{freq_col}"] = train_col_str.map(freq_map).fillna(0).astype("float64")
+    result[f"val_{freq_col}"] = val_col_str.map(freq_map).fillna(0).astype("float64")
+    if test_col_str is not None:
+        result[f"test_{freq_col}"] = test_col_str.map(freq_map).fillna(0).astype("float64")
+
+    return result
+
+
 def compute_fold_target_encoding(
     X_train_fold: pd.DataFrame,
     y_train_fold: np.ndarray,
@@ -52,6 +91,17 @@ def compute_fold_target_encoding(
     """Fold 내부에서 Bayesian Smoothed Target Encoding을 수행합니다.
 
     학습 fold에서만 encoding map을 계산하여 CV 누수를 방지합니다.
+    각 대상 컬럼에 대해 2개씩 파생 피처를 생성합니다.
+    컬럼별 인코딩은 ThreadPoolExecutor로 병렬 처리됩니다.
+
+    생성 피처 (대상 컬럼별):
+        - te_{컬럼명}: Bayesian Smoothed Target Encoding 값
+          (해당 범주의 평균 target을 smoothing하여 수치화)
+        - freq_{컬럼명}: 빈도 인코딩 값
+          (해당 범주의 학습 데이터 내 거래 건수 = 인기도 지표)
+
+    기본 대상 컬럼 (config.target_encode_cols):
+        아파트명, 도로명, 번지, 시군구, 구, 동 → 총 12개 피처 생성
     """
     X_train_fold = X_train_fold.copy()
     X_val_fold = X_val_fold.copy()
@@ -59,50 +109,50 @@ def compute_fold_target_encoding(
 
     global_mean = float(np.mean(y_train_fold))
 
-    for col in te_cols:
-        if col not in X_train_fold.columns:
-            continue
+    # 유효 컬럼만 필터링
+    valid_cols = [c for c in te_cols if c in X_train_fold.columns]
 
-        # 그룹별 통계 (train fold만 사용)
-        tmp = pd.DataFrame({
-            "key": X_train_fold[col].astype(str),
-            "y": y_train_fold,
-        })
-        group_stats = tmp.groupby("key")["y"].agg(["mean", "count"])
+    # 컬럼별 문자열 변환 미리 수행 (공유)
+    train_str = {c: X_train_fold[c].astype(str) for c in valid_cols}
+    val_str = {c: X_val_fold[c].astype(str) for c in valid_cols}
+    test_str = (
+        {c: X_test_out[c].astype(str) for c in valid_cols}
+        if X_test_out is not None else {}
+    )
 
-        # Bayesian Smoothed Mean
-        smoothed = (
-            group_stats["count"] * group_stats["mean"]
-            + smoothing * global_mean
-        ) / (group_stats["count"] + smoothing)
-        encoding_map = smoothed.to_dict()
+    # ThreadPoolExecutor로 컬럼별 병렬 인코딩
+    max_workers = min(len(valid_cols), 6)
+    all_results: list[dict[str, pd.Series]] = []
 
-        # 적용
-        te_col = f"te_{col}"
-        X_train_fold[te_col] = (
-            X_train_fold[col].astype(str).map(encoding_map).fillna(global_mean)
-        )
-        X_val_fold[te_col] = (
-            X_val_fold[col].astype(str).map(encoding_map).fillna(global_mean)
-        )
-        if X_test_out is not None:
-            X_test_out[te_col] = (
-                X_test_out[col].astype(str).map(encoding_map).fillna(global_mean)
-            )
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _encode_single_column,
+                col,
+                train_str[col],
+                val_str[col],
+                test_str.get(col),
+                y_train_fold,
+                global_mean,
+                smoothing,
+            ): col
+            for col in valid_cols
+        }
+        for future in futures:
+            all_results.append(future.result())
 
-        # 빈도 인코딩
-        freq_col = f"freq_{col}"
-        freq_map = X_train_fold[col].astype(str).value_counts().to_dict()
-        X_train_fold[freq_col] = (
-            X_train_fold[col].astype(str).map(freq_map).fillna(0).astype("float64")
-        )
-        X_val_fold[freq_col] = (
-            X_val_fold[col].astype(str).map(freq_map).fillna(0).astype("float64")
-        )
-        if X_test_out is not None:
-            X_test_out[freq_col] = (
-                X_test_out[col].astype(str).map(freq_map).fillna(0).astype("float64")
-            )
+    # 결과 합치기
+    for res in all_results:
+        for key, series in res.items():
+            if key.startswith("train_"):
+                col_name = key[len("train_"):]
+                X_train_fold[col_name] = series
+            elif key.startswith("val_"):
+                col_name = key[len("val_"):]
+                X_val_fold[col_name] = series
+            elif key.startswith("test_") and X_test_out is not None:
+                col_name = key[len("test_"):]
+                X_test_out[col_name] = series
 
     return X_train_fold, X_val_fold, X_test_out
 

@@ -10,12 +10,17 @@
     Step 2.5 → Float→Int64 타입 변환
     Step 3   → 컬럼명 정리 (LightGBM 호환)
     Step 3.5 → 날짜/주소 파생 피처
+    Step 3.7 → 시간 파생 피처 (계약년/월/분기/반기 + cyclical)
     Step 4   → 범주형 컬럼 식별
     Step 5   → 결측 지표 피처
     Step 6   → 좌표 보간 (Kakao API + 시군구 평균)
-    Step 7   → 결측값 대체 (KNN Imputer)
+    Step 6.5 → 공간 파생 피처 (랜드마크 거리)
+    Step 6.7 → 버스/지하철 거리 피처 (BallTree)
+    Step 7   → 결측값 대체 (Median Imputer)
     Step 7.5 → 세대당 주차대수 파생 피처
-    Step 8   → 이상치 클리핑
+    Step 7.7 → 교호작용/도메인 피처 (재건축 후보, 층구간, 면적대)
+    Step 8   → 이상치 클리핑 (학습 IQR → 테스트 동일 적용)
+    Step 8.5 → 저중요도 피처 제거
     Step 9   → Target 로그 변환
 """
 
@@ -27,11 +32,11 @@ import re
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.impute import KNNImputer
 from tqdm.auto import tqdm
 
 from .base import PreprocessingContext, PreprocessingStep
@@ -210,7 +215,21 @@ class SanitizeColumnNamesStep(PreprocessingStep):
 # Step 3.5: 날짜/주소 파생 피처
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class DateAddressFeaturesStep(PreprocessingStep):
-    """날짜 파싱, 주소 분리, 경과연수 등 파생 피처를 생성합니다."""
+    """날짜 파싱, 주소 분리, 경과연수 등 파생 피처를 생성합니다.
+
+    아파트 실거래 데이터의 계약 정보와 주소 체계를 활용하여
+    가격에 직접적으로 영향을 미치는 핵심 파생 피처를 생성합니다.
+
+    생성 피처:
+        - 계약일자: 계약년월 + 계약일 → YYYYMMDD 정수
+          (시계열 정렬 및 계절/월말 효과 포착용)
+        - 구: 시군구에서 분리한 자치구명 (예: 강남구, 서초구)
+          (자치구별 가격 수준 차이 — 아파트 가격의 최대 결정 요인)
+        - 동: 시군구에서 분리한 법정동명 (예: 대치동, 잠실동)
+          (동별 학군·인프라·선호도에 따른 세밀한 가격 차이)
+        - 건물나이: 계약년도 − 건축년도 (경과연수, 0 이상 클리핑)
+          (감가상각 효과 + 재건축 기대감의 이중 가격 구조)
+    """
 
     @property
     def name(self) -> str:
@@ -349,7 +368,14 @@ class IdentifyCategoricalColumnsStep(PreprocessingStep):
 # Step 5: 결측 지표 피처
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class MissingIndicatorStep(PreprocessingStep):
-    """각 행의 결측값 총 개수를 새로운 피처로 생성합니다."""
+    """각 행의 결측값 총 개수를 새로운 피처로 생성합니다.
+
+    결측값이 많은 행은 데이터 품질이 낮거나 신규 등록 단지일 가능성이 있어,
+    결측 개수 자체가 가격 예측에 유의미한 신호가 됩니다.
+
+    생성 피처:
+        - missing_count: 해당 행의 전체 컬럼 결측값 개수 (int)
+    """
 
     @property
     def name(self) -> str:
@@ -445,18 +471,43 @@ class CoordinateInterpolationStep(PreprocessingStep):
         coord_global_means: dict[str, float] = {}
         kakao_cache: dict | None = {} if use_kakao_api and kakao_api_key else None
 
-        # 1단계: Kakao API
+        # 1단계: Kakao API (ThreadPoolExecutor 병렬 호출)
         if kakao_cache is not None and "좌표X" in df.columns and "좌표Y" in df.columns:
             missing_both = df["좌표X"].isna() & df["좌표Y"].isna()
             if missing_both.any():
                 addr_series = df.loc[missing_both].apply(cls._build_address, axis=1)
                 unique_addr = addr_series[addr_series.str.len() > 0].unique()
                 addr_to_coord: dict[str, tuple[float, float]] = {}
-                for addr in tqdm(unique_addr, desc="Kakao API 주소→좌표 조회", leave=False):
-                    r = cls._fetch_coords_from_kakao(addr, kakao_api_key, kakao_cache, 0)
-                    if r:
-                        addr_to_coord[addr] = r
-                    time.sleep(kakao_delay_sec)
+
+                max_workers = min(8, len(unique_addr))  # Rate limiting 고려
+                if max_workers > 1:
+                    print(f"  Kakao API: {len(unique_addr):,}건 병렬 조회 (workers={max_workers})")
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {
+                            executor.submit(
+                                cls._fetch_coords_from_kakao,
+                                addr, kakao_api_key, kakao_cache, kakao_delay_sec,
+                            ): addr
+                            for addr in unique_addr
+                        }
+                        for future in tqdm(
+                            as_completed(futures), total=len(futures),
+                            desc="Kakao API 주소→좌표 조회", leave=False,
+                        ):
+                            addr = futures[future]
+                            try:
+                                r = future.result()
+                                if r:
+                                    addr_to_coord[addr] = r
+                            except Exception:
+                                pass
+                else:
+                    for addr in tqdm(unique_addr, desc="Kakao API 주소→좌표 조회", leave=False):
+                        r = cls._fetch_coords_from_kakao(addr, kakao_api_key, kakao_cache, 0)
+                        if r:
+                            addr_to_coord[addr] = r
+                        time.sleep(kakao_delay_sec)
+
                 coords = addr_series.map(addr_to_coord)
                 valid_idx = coords.dropna().index
                 if len(valid_idx) > 0:
@@ -650,6 +701,48 @@ class TransitFeaturesStep(PreprocessingStep):
         return bus_coords, subway_coords, subway_df
 
     @staticmethod
+    def _process_subway_chunk(
+        chunk_q: np.ndarray,
+        tree_data: np.ndarray,
+        radius_rad: float,
+        earth_radius_km: float,
+        line_values: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        """지하철 청크를 병렬로 처리합니다."""
+        from sklearn.neighbors import BallTree
+
+        tree = BallTree(tree_data, metric="haversine")
+        dist, _ = tree.query(chunk_q, k=1)
+        nearest = dist.flatten() * earth_radius_km
+        counts = tree.query_radius(chunk_q, r=radius_rad, count_only=True)
+
+        lines = None
+        if line_values is not None:
+            lines = np.zeros(len(chunk_q), dtype="int32")
+            indices = tree.query_radius(chunk_q, r=radius_rad)
+            for j, idx_list in enumerate(indices):
+                if len(idx_list) > 0:
+                    lines[j] = len(set(line_values[idx_list]))
+
+        return nearest, counts, lines
+
+    @staticmethod
+    def _process_bus_chunk(
+        chunk_q: np.ndarray,
+        tree_data: np.ndarray,
+        radius_rad: float,
+        earth_radius_km: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """버스 청크를 병렬로 처리합니다."""
+        from sklearn.neighbors import BallTree
+
+        tree = BallTree(tree_data, metric="haversine")
+        dist, _ = tree.query(chunk_q, k=1)
+        nearest = dist.flatten() * earth_radius_km
+        counts = tree.query_radius(chunk_q, r=radius_rad, count_only=True)
+        return nearest, counts
+
+    @staticmethod
     def _compute_features(
         df: pd.DataFrame,
         bus_coords_rad: np.ndarray | None,
@@ -659,9 +752,14 @@ class TransitFeaturesStep(PreprocessingStep):
         subway_radius_m: float,
         coord_was_missing: pd.Series | None = None,
         chunk_size: int = 50_000,
+        n_jobs: int = -1,
     ) -> pd.DataFrame:
-        """BallTree로 거리 피처를 계산합니다 (청크 단위 처리)."""
-        from sklearn.neighbors import BallTree
+        """BallTree로 거리 피처를 계산합니다 (joblib 병렬 청크 처리).
+
+        Args:
+            n_jobs: 병렬 워커 수. -1이면 전체 CPU 코어 사용.
+        """
+        from joblib import Parallel, delayed
 
         df = df.copy()
         created: list[str] = []
@@ -676,77 +774,68 @@ class TransitFeaturesStep(PreprocessingStep):
         lat = df["좌표Y"].astype("float64").values
         query_rad = np.radians(np.column_stack([lat, lon]))
 
-        # ── 지하철 피처 (청크 처리) ──
+        # 청크 슬라이스 목록
+        n_chunks = (n + chunk_size - 1) // chunk_size
+        chunks = [
+            (i * chunk_size, min((i + 1) * chunk_size, n))
+            for i in range(n_chunks)
+        ]
+
+        # ── 지하철 피처 (병렬 청크 처리) ──
         if subway_coords_rad is not None and len(subway_coords_rad) > 0:
-            tree = BallTree(subway_coords_rad, metric="haversine")
             radius_rad = subway_radius_m / (EARTH_RADIUS_KM * 1000)
 
-            nearest_dist = np.zeros(n, dtype="float64")
-            count_arr = np.zeros(n, dtype="int32")
-
-            # 호선 수 계산용
             line_col = next(
                 (c for c in (subway_df.columns if subway_df is not None else [])
                  if "호선" in c or "line" in c.lower()),
                 None,
             )
-            line_arr = np.zeros(n, dtype="int32") if line_col else None
             line_values = subway_df[line_col].values if (line_col and subway_df is not None) else None
 
-            n_chunks = (n + chunk_size - 1) // chunk_size
-            for i in range(n_chunks):
-                s, e = i * chunk_size, min((i + 1) * chunk_size, n)
-                chunk_q = query_rad[s:e]
+            print(f"    지하철 피처: {n_chunks}개 청크 병렬 처리 (n_jobs={n_jobs})")
+            results = Parallel(n_jobs=n_jobs, prefer="processes")(
+                delayed(TransitFeaturesStep._process_subway_chunk)(
+                    query_rad[s:e], subway_coords_rad, radius_rad,
+                    EARTH_RADIUS_KM, line_values,
+                )
+                for s, e in chunks
+            )
 
-                dist, _ = tree.query(chunk_q, k=1)
-                nearest_dist[s:e] = dist.flatten() * EARTH_RADIUS_KM
-
-                counts = tree.query_radius(chunk_q, r=radius_rad, count_only=True)
-                count_arr[s:e] = counts
-
-                if line_values is not None:
-                    indices = tree.query_radius(chunk_q, r=radius_rad)
-                    for j, idx_list in enumerate(indices):
-                        if len(idx_list) > 0:
-                            line_arr[s + j] = len(set(line_values[idx_list]))
-
-                if (i + 1) % 5 == 0 or i == n_chunks - 1:
-                    print(f"    지하철 피처: {e:,}/{n:,} ({100 * e / n:.0f}%)")
-
+            nearest_dist = np.concatenate([r[0] for r in results])
+            count_arr = np.concatenate([r[1] for r in results])
             df["nearest_subway_dist"] = nearest_dist
             created.append("nearest_subway_dist")
             df["subway_count_1km"] = count_arr
             created.append("subway_count_1km")
-            if line_arr is not None:
+
+            if line_col is not None:
+                line_arr = np.concatenate([r[2] for r in results])
                 df["subway_lines_1km"] = line_arr
                 created.append("subway_lines_1km")
 
-        # ── 버스 피처 (청크 처리) ──
+            print(f"    지하철 피처 완료: {n:,}건")
+
+        # ── 버스 피처 (병렬 청크 처리) ──
         if bus_coords_rad is not None and len(bus_coords_rad) > 0:
-            tree = BallTree(bus_coords_rad, metric="haversine")
             radius_rad = bus_radius_m / (EARTH_RADIUS_KM * 1000)
 
-            nearest_dist = np.zeros(n, dtype="float64")
-            count_arr = np.zeros(n, dtype="int32")
+            print(f"    버스 피처: {n_chunks}개 청크 병렬 처리 (n_jobs={n_jobs})")
+            results = Parallel(n_jobs=n_jobs, prefer="processes")(
+                delayed(TransitFeaturesStep._process_bus_chunk)(
+                    query_rad[s:e], bus_coords_rad, radius_rad,
+                    EARTH_RADIUS_KM,
+                )
+                for s, e in chunks
+            )
 
-            n_chunks = (n + chunk_size - 1) // chunk_size
-            for i in range(n_chunks):
-                s, e = i * chunk_size, min((i + 1) * chunk_size, n)
-                chunk_q = query_rad[s:e]
-
-                dist, _ = tree.query(chunk_q, k=1)
-                nearest_dist[s:e] = dist.flatten() * EARTH_RADIUS_KM
-
-                counts = tree.query_radius(chunk_q, r=radius_rad, count_only=True)
-                count_arr[s:e] = counts
-
-                if (i + 1) % 5 == 0 or i == n_chunks - 1:
-                    print(f"    버스 피처: {e:,}/{n:,} ({100 * e / n:.0f}%)")
-
+            nearest_dist = np.concatenate([r[0] for r in results])
+            count_arr = np.concatenate([r[1] for r in results])
             df["nearest_bus_dist"] = nearest_dist
             created.append("nearest_bus_dist")
             df["bus_count_500m"] = count_arr
             created.append("bus_count_500m")
+
+            print(f"    버스 피처 완료: {n:,}건")
 
         # ── is_real_coord 플래그 ──
         if coord_was_missing is not None:
@@ -808,29 +897,33 @@ class TransitFeaturesStep(PreprocessingStep):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Step 7: 결측값 대체 (KNN Imputer)
+# Step 7: 결측값 대체 (Median Imputer)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class MissingValueImputerStep(PreprocessingStep):
-    """범주형 → '미상' 대체, 수치형 → KNN Imputer로 결측을 보간합니다."""
+    """범주형 → '미상' 대체, 수치형 → Median Imputer로 결측을 보간합니다.
+
+    트리 기반 모델(LightGBM, XGBoost, CatBoost)은 결측값을 자체 처리하지만,
+    일부 파생 피처 계산 시 NaN이 전파되므로 중앙값으로 빠르게 대체합니다.
+    학습 데이터에서 계산한 Median을 테스트 데이터에도 동일 적용하여
+    데이터 누수를 방지합니다.
+    """
 
     @property
     def name(self) -> str:
-        return "Step 7: 결측값 대체 (KNN Imputer)"
+        return "Step 7: 결측값 대체 (Median Imputer)"
 
     @staticmethod
     def _handle_missing(
         df: pd.DataFrame,
         categorical_cols: list[str],
-        n_neighbors: int = 5,
-        sample_size: int = 30_000,
-        chunk_size: int = 50_000,
         fitted_medians: dict | None = None,
         numeric_cols_order: list[str] | None = None,
     ) -> tuple[pd.DataFrame, dict | None, list[str] | None]:
-        """결측값 처리: 범주형→'미상', 수치형→중앙값 대체.
+        """결측값 처리: 범주형→'미상', 수치형→중앙값(Median) 대체.
 
         트리 기반 모델(LightGBM, XGBoost, CatBoost)은 결측값을 자체 처리하지만,
         일부 파생 피처 계산 시 NaN이 전파되므로 중앙값으로 빠르게 대체합니다.
+        학습 데이터에서 계산한 Median을 테스트 데이터에도 동일 적용합니다.
         """
         df = df.copy()
 
@@ -915,7 +1008,21 @@ class MissingValueImputerStep(PreprocessingStep):
 # Step 7.5: 세대당 주차대수 파생 피처
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class ParkingPerHouseholdStep(PreprocessingStep):
-    """주차대수 / k-전체세대수 = 세대당 주차대수 피처를 생성합니다."""
+    """세대당 주차대수 비율 피처를 생성합니다.
+
+    아파트 단지의 주차 편의성은 입주민 만족도와 직결되며,
+    특히 차량 보유율이 높은 수도권에서 가격에 유의미한 영향을 미칩니다.
+    주차대수 자체보다 세대 수 대비 비율이 실질적 편의성을 더 잘 반영합니다.
+
+    생성 피처:
+        - parking_per_household: 주차대수 / 전체세대수
+          (값이 클수록 세대당 주차 여유 공간이 많음)
+          (일반적으로 1.0 이상이면 세대당 1대 이상 주차 가능)
+
+    계산 공식:
+        parking_per_household = 주차대수 / (k-전체세대수 + ε)
+        ε = 1e-6 (0 나눗셈 방지)
+    """
 
     @property
     def name(self) -> str:
@@ -960,28 +1067,36 @@ class ParkingPerHouseholdStep(PreprocessingStep):
 # Step 7.7: 교호작용 / 비율 파생 피처
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class InteractionFeaturesStep(PreprocessingStep):
-    """수치형 피처 간 교호작용/비율/변환 피처를 생성합니다.
+    """수치형 피처 간 교호작용/비율/변환/도메인 피처를 생성합니다.
 
     트리 모델은 피처 간 곱/나눗셈을 직접 학습하기 어렵기 때문에
     도메인 지식 기반의 파생 피처를 명시적으로 생성합니다.
 
     생성 피처:
+        [교호작용/비율]
         - 면적x층: 전용면적 × 층 (고층 대형 프리미엄)
         - 면적_건물나이비: 전용면적 / (건물나이+1) (신축 대형의 가치)
         - log_전용면적: log1p(전용면적) (비선형 면적 효과)
         - 전용면적_sq: 전용면적² (면적 증가에 따른 가속 가격 상승)
         - 층_건물나이비: 층 / (건물나이+1) (신축 고층 프리미엄)
         - 동당세대수: k-전체세대수 / (k-전체동수+1) (단지 밀집도)
+
+        [도메인 피처]
+        - is_rebuild_candidate: 건물나이 ≥ 30년 여부 (재건축 기대감)
+        - 층구간: 저층(1~3)/중층(4~10)/고층(11~20)/최상층(21+) (비선형 층 효과)
+        - 면적대: 소형(~59)/국민평형(~84)/중형(~135)/대형(135+) (시장 세그먼트)
     """
 
     @property
     def name(self) -> str:
-        return "Step 7.7: 교호작용 피처"
+        return "Step 7.7: 교호작용/도메인 피처"
 
     @staticmethod
     def _add_features(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         created: list[str] = []
+
+        # ── 교호작용 / 비율 피처 ──
 
         # 전용면적 × 층 (고층 대형 프리미엄)
         if "전용면적" in df.columns and "층" in df.columns:
@@ -1023,11 +1138,54 @@ class InteractionFeaturesStep(PreprocessingStep):
             df["동당세대수"] = household / (buildings + 1)
             created.append("동당세대수")
 
+        # ── 도메인 지식 기반 피처 ──
+
+        # 재건축 기대 여부 (건물나이 ≥ 30년)
+        # 재건축 연한 도달 시 가격에 재건축 프리미엄이 반영됨
+        if "건물나이" in df.columns:
+            age = pd.to_numeric(df["건물나이"], errors="coerce").fillna(0)
+            df["is_rebuild_candidate"] = (age >= 30).astype("int8")
+            created.append("is_rebuild_candidate")
+            n_rebuild = df["is_rebuild_candidate"].sum()
+            print(f"    재건축 후보: {n_rebuild:,}건 ({n_rebuild / len(df) * 100:.1f}%)")
+
+        # 층 구간화 (저층 페널티 → 로열층 프리미엄 → 최상층)
+        # 부동산 시장에서 1~3층 저층은 가격이 낮고, 중상층이 로열층으로 프리미엄
+        if "층" in df.columns:
+            floor = pd.to_numeric(df["층"], errors="coerce").fillna(0)
+            df["층구간"] = pd.cut(
+                floor,
+                bins=[-np.inf, 3, 10, 20, np.inf],
+                labels=[0, 1, 2, 3],  # 저층/중층/고층/최상층
+            ).astype("float64").fillna(0).astype("int8")
+            created.append("층구간")
+            dist = df["층구간"].value_counts().sort_index()
+            print(f"    층구간 분포: 저층(0~3)={dist.get(0, 0):,}, "
+                  f"중층(4~10)={dist.get(1, 0):,}, "
+                  f"고층(11~20)={dist.get(2, 0):,}, "
+                  f"최상층(21+)={dist.get(3, 0):,}")
+
+        # 면적대 구분 (시장에서 통용되는 세그먼트)
+        # 소형(~59㎡), 국민평형(~84㎡), 중형(~135㎡), 대형(135㎡+)
+        if "전용면적" in df.columns:
+            area = pd.to_numeric(df["전용면적"], errors="coerce").fillna(0)
+            df["면적대"] = pd.cut(
+                area,
+                bins=[-np.inf, 59, 84, 135, np.inf],
+                labels=[0, 1, 2, 3],  # 소형/국민평형/중형/대형
+            ).astype("float64").fillna(0).astype("int8")
+            created.append("면적대")
+            dist = df["면적대"].value_counts().sort_index()
+            print(f"    면적대 분포: 소형(~59)={dist.get(0, 0):,}, "
+                  f"국민평형(~84)={dist.get(1, 0):,}, "
+                  f"중형(~135)={dist.get(2, 0):,}, "
+                  f"대형(135+)={dist.get(3, 0):,}")
+
         # inf / NaN 안전 처리
         for col in created:
             df[col] = df[col].replace([np.inf, -np.inf], np.nan).fillna(0)
 
-        print(f"  생성된 교호작용 피처 ({len(created)}개): {created}")
+        print(f"  생성된 교호작용/도메인 피처 ({len(created)}개): {created}")
         return df
 
     def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
@@ -1163,27 +1321,51 @@ class TargetEncodingStep(PreprocessingStep):
 # Step 8: 이상치 클리핑
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class OutlierClippingStep(PreprocessingStep):
-    """IQR 기반 이상치 클리핑 + Target 퍼센타일 클리핑."""
+    """IQR 기반 이상치 클리핑 + Target 퍼센타일 클리핑.
+
+    학습 데이터에서 계산한 IQR 범위(하한/상한)를 저장하고,
+    테스트 데이터에도 동일한 범위를 적용하여 학습/테스트 간
+    값 범위 일관성을 보장합니다.
+    """
 
     @property
     def name(self) -> str:
         return "Step 8: 이상치 클리핑"
 
     @staticmethod
-    def _clip_features(
+    def _compute_clip_bounds(
         df: pd.DataFrame, columns: list[str], factor: float,
-    ) -> pd.DataFrame:
-        df = df.copy()
-        total_clipped = 0
+    ) -> dict[str, tuple[float, float]]:
+        """학습 데이터에서 IQR 기반 클리핑 범위를 계산합니다.
+
+        Returns:
+            {컬럼명: (하한, 상한)} 딕셔너리
+        """
+        bounds: dict[str, tuple[float, float]] = {}
         for col in columns:
             if col not in df.columns:
-                print(f"    {col}: 컬럼 없음 — 건너뜀")
                 continue
             q1 = df[col].quantile(0.25)
             q3 = df[col].quantile(0.75)
             iqr = q3 - q1
             lower = q1 - factor * iqr
             upper = q3 + factor * iqr
+            bounds[col] = (lower, upper)
+        return bounds
+
+    @staticmethod
+    def _clip_features_with_bounds(
+        df: pd.DataFrame,
+        bounds: dict[str, tuple[float, float]],
+        label: str = "",
+    ) -> pd.DataFrame:
+        """사전 계산된 범위로 피처를 클리핑합니다."""
+        df = df.copy()
+        total_clipped = 0
+        for col, (lower, upper) in bounds.items():
+            if col not in df.columns:
+                print(f"    {col}: 컬럼 없음 — 건너뜀")
+                continue
             n_below = (df[col] < lower).sum()
             n_above = (df[col] > upper).sum()
             n_clipped = n_below + n_above
@@ -1194,7 +1376,7 @@ class OutlierClippingStep(PreprocessingStep):
                     f"(하한={lower:.2f}, 상한={upper:.2f})"
                 )
             total_clipped += n_clipped
-        print(f"    총 클리핑: {total_clipped:,}건")
+        print(f"    총 클리핑{label}: {total_clipped:,}건")
         return df
 
     @staticmethod
@@ -1214,9 +1396,23 @@ class OutlierClippingStep(PreprocessingStep):
     def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
         cfg = ctx.config
 
-        # 수치형 피처 클리핑 (학습 데이터만)
+        # 학습 데이터에서 IQR 범위 계산
+        clip_bounds = self._compute_clip_bounds(
+            ctx.X_train, cfg.outlier_clip_cols, cfg.outlier_iqr_factor,
+        )
+        ctx.train_stats["clip_bounds"] = clip_bounds
+
+        # 학습 데이터 클리핑
         print("  수치형 이상치 클리핑 (학습 데이터):")
-        ctx.X_train = self._clip_features(ctx.X_train, cfg.outlier_clip_cols, cfg.outlier_iqr_factor)
+        ctx.X_train = self._clip_features_with_bounds(
+            ctx.X_train, clip_bounds, label=" (학습)",
+        )
+
+        # 테스트 데이터 클리핑 (학습 기준 동일 범위 적용)
+        print("\n  수치형 이상치 클리핑 (테스트 데이터 — 학습 기준 범위):")
+        ctx.X_test = self._clip_features_with_bounds(
+            ctx.X_test, clip_bounds, label=" (테스트)",
+        )
 
         # Target 클리핑
         print("\n  Target 이상치 클리핑:")

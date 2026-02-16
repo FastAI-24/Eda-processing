@@ -138,6 +138,7 @@ class ModelConfig:
     categorical_features: list[str] | None = None
 
     # ── 앙상블 설정 ──
+    # 3개 모델 앙상블: 모델 다양성이 높을수록 일반화 성능 향상
     ensemble_models: list[str] = field(
-        default_factory=lambda: ["lightgbm", "xgboost"]
+        default_factory=lambda: ["lightgbm", "xgboost", "catboost"]
     )
