@@ -73,6 +73,7 @@ class ModelConfig:
     target_encode_cols: list[str] = field(
         default_factory=lambda: [
             "아파트명", "도로명", "번지", "시군구", "구", "동",
+            "coord_cluster",
         ]
     )
     target_encode_smoothing: int = 100

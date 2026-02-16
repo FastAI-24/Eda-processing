@@ -11,16 +11,19 @@
     Step 3   → 컬럼명 정리 (LightGBM 호환)
     Step 3.5 → 날짜/주소 파생 피처
     Step 3.7 → 시간 파생 피처 (계약년/월/분기/반기 + cyclical)
+    Step 3.8 → 최신 데이터 필터링 (Exp06: 2017+ 학습 데이터 필터링)
     Step 4   → 범주형 컬럼 식별
     Step 5   → 결측 지표 피처
     Step 6   → 좌표 보간 (Kakao API + 시군구 평균)
     Step 6.5 → 공간 파생 피처 (랜드마크 거리)
     Step 6.7 → 버스/지하철 거리 피처 (BallTree)
+    Step 6.8 → 공간 클러스터링 (Exp08: K-Means 좌표 클러스터)
     Step 7   → 결측값 대체 (Median Imputer)
     Step 7.5 → 세대당 주차대수 파생 피처
+    Step 7.6 → 단지 품질 피처 (Exp07: unit_area_avg, 로그 변환)
     Step 7.7 → 교호작용/도메인 피처 (재건축 후보, 층구간, 면적대)
     Step 8   → 이상치 클리핑 (학습 IQR → 테스트 동일 적용)
-    Step 8.5 → 저중요도 피처 제거
+    Step 8.5 → 저중요도 피처 + Feature Diet 제거 (Exp07)
     Step 9   → Target 로그 변환
 """
 
@@ -321,6 +324,50 @@ class TemporalFeaturesStep(PreprocessingStep):
         ctx.X_train = self._add_features(ctx.X_train)
         print("  테스트 데이터:")
         ctx.X_test = self._add_features(ctx.X_test)
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 3.8: 최신 데이터 필터링 (Exp06)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class RecentDataFilterStep(PreprocessingStep):
+    """학습 데이터에서 최신 데이터만 필터링합니다 (Exp06).
+
+    '유령 지하철' 문제(과거 가격에 미래 노선이 반영되는 누수)와
+    인플레이션 소음을 해결하기 위해, 설정된 연도 이후의 거래만 사용합니다.
+    테스트 데이터는 모든 행을 유지합니다 (제출용).
+
+    설정:
+        config.recent_data_year_from: 필터링 시작 연도 (None이면 비활성)
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 3.8: 최신 데이터 필터링"
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        year_from = ctx.config.recent_data_year_from
+        if year_from is None:
+            print("  비활성 (recent_data_year_from=None) — 전체 데이터 사용")
+            return ctx
+
+        if "계약년" not in ctx.X_train.columns:
+            print("  '계약년' 컬럼 없음 — 건너뜀 (TemporalFeaturesStep 이후에 배치하세요)")
+            return ctx
+
+        before = len(ctx.X_train)
+        mask = ctx.X_train["계약년"] >= year_from
+        keep_idx = ctx.X_train.index[mask]
+        ctx.X_train = ctx.X_train.loc[keep_idx].reset_index(drop=True)
+        ctx.y_train = ctx.y_train.loc[keep_idx].reset_index(drop=True)
+        after = len(ctx.X_train)
+
+        removed = before - after
+        year_range = f"{int(ctx.X_train['계약년'].min())}~{int(ctx.X_train['계약년'].max())}"
+        print(f"  필터링: {year_from}년 이후 데이터만 사용")
+        print(f"  Before: {before:,}건 → After: {after:,}건 (제거: {removed:,}건, {removed / before * 100:.1f}%)")
+        print(f"  학습 데이터 연도 범위: {year_range}")
+        print(f"  테스트 데이터: 변경 없음 ({len(ctx.X_test):,}건)")
         return ctx
 
 
@@ -897,6 +944,91 @@ class TransitFeaturesStep(PreprocessingStep):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 6.8: 좌표 기반 공간 클러스터링 (Exp08)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class SpatialClusteringStep(PreprocessingStep):
+    """표준화된 좌표에 K-Means 클러스터링을 적용하여 생활권을 정의합니다 (Exp08).
+
+    행정구역(동) 경계를 넘어 실제 좌표 기반의 '생활권' 클러스터를 생성합니다.
+    이 클러스터는 이후 Fold 내 Target Encoding의 대상 컬럼으로 활용되어
+    coord_cluster_mean_price (생활권 평균 가격) 피처를 생성합니다.
+
+    생성 피처:
+        - coord_cluster: K-Means 클러스터 ID (int)
+
+    설정:
+        config.spatial_n_clusters: K-Means 클러스터 수 (기본값: 150)
+
+    데이터 누수 방지:
+        - 학습 데이터에서 StandardScaler + KMeans를 fit
+        - 테스트 데이터에는 학습 기준 scaler/kmeans를 transform/predict
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 6.8: 공간 클러스터링"
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler
+
+        n_clusters = ctx.config.spatial_n_clusters
+
+        if "좌표X" not in ctx.X_train.columns or "좌표Y" not in ctx.X_train.columns:
+            print("  좌표 컬럼 없음 — 건너뜀")
+            return ctx
+
+        # ── 학습 데이터: fit + predict ──
+        coords_train = ctx.X_train[["좌표X", "좌표Y"]].values.astype("float64")
+
+        train_nan_mask = np.isnan(coords_train).any(axis=1)
+        if train_nan_mask.any():
+            print(f"  [WARN] 학습 데이터 좌표 NaN: {train_nan_mask.sum():,}건 → 전체 평균으로 대체")
+            col_means = np.nanmean(coords_train, axis=0)
+            coords_train[train_nan_mask] = col_means
+
+        scaler = StandardScaler()
+        coords_train_scaled = scaler.fit_transform(coords_train)
+
+        kmeans = KMeans(
+            n_clusters=n_clusters,
+            random_state=42,
+            n_init=10,
+            max_iter=300,
+        )
+        ctx.X_train["coord_cluster"] = kmeans.fit_predict(coords_train_scaled)
+
+        # ── 테스트 데이터: transform + predict ──
+        coords_test = ctx.X_test[["좌표X", "좌표Y"]].values.astype("float64")
+
+        test_nan_mask = np.isnan(coords_test).any(axis=1)
+        if test_nan_mask.any():
+            print(f"  [WARN] 테스트 데이터 좌표 NaN: {test_nan_mask.sum():,}건 → 학습 평균으로 대체")
+            col_means_test = np.nanmean(coords_test, axis=0)
+            coords_test[test_nan_mask] = col_means_test
+
+        coords_test_scaled = scaler.transform(coords_test)
+        ctx.X_test["coord_cluster"] = kmeans.predict(coords_test_scaled)
+
+        # ── 통계 저장 (재현성) ──
+        ctx.train_stats["spatial_scaler"] = scaler
+        ctx.train_stats["spatial_kmeans"] = kmeans
+
+        # ── 결과 출력 ──
+        cluster_counts = ctx.X_train["coord_cluster"].value_counts()
+        print(f"  K-Means 클러스터링 완료 (K={n_clusters})")
+        print(f"  학습: {len(ctx.X_train):,}건 → {n_clusters}개 클러스터")
+        print(f"  테스트: {len(ctx.X_test):,}건 → {ctx.X_test['coord_cluster'].nunique()}개 클러스터 사용")
+        print(
+            f"  클러스터 크기: min={cluster_counts.min():,}, "
+            f"max={cluster_counts.max():,}, "
+            f"mean={cluster_counts.mean():.0f}"
+        )
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Step 7: 결측값 대체 (Median Imputer)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class MissingValueImputerStep(PreprocessingStep):
@@ -1059,6 +1191,69 @@ class ParkingPerHouseholdStep(PreprocessingStep):
         ctx.X_train = self._add_feature(ctx.X_train)
         print("  테스트 데이터:")
         ctx.X_test = self._add_feature(ctx.X_test)
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 7.6: 단지 품질 피처 (Exp07)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class QualityFeaturesStep(PreprocessingStep):
+    """단지의 품질을 나타내는 상대적 지표 피처를 생성합니다 (Exp07).
+
+    절대적 수치(전체세대수, 연면적 등)를 상대적 품질 지표로 변환하고,
+    대형 수치에 로그 변환을 적용하여 스케일 차이를 줄입니다.
+
+    생성 피처:
+        - unit_area_avg: 평균 전용면적 (k-주거전용면적 / k-전체세대수)
+          (단지의 고급화 정도를 나타내는 지표)
+        - log_전체세대수: log1p(k-전체세대수)
+          (세대수의 비선형 스케일 조정)
+        - log_연면적: log1p(k-연면적)
+          (연면적의 비선형 스케일 조정)
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 7.6: 단지 품질 피처"
+
+    @staticmethod
+    def _add_features(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        created: list[str] = []
+
+        # 1) 평균 전용면적 = 주거전용면적 / 전체세대수
+        if "k-주거전용면적" in df.columns and "k-전체세대수" in df.columns:
+            area = pd.to_numeric(df["k-주거전용면적"], errors="coerce").fillna(0)
+            units = pd.to_numeric(df["k-전체세대수"], errors="coerce").fillna(0)
+            df["unit_area_avg"] = area / (units + 1e-6)
+            df["unit_area_avg"] = (
+                df["unit_area_avg"].replace([np.inf, -np.inf], 0).fillna(0)
+            )
+            created.append("unit_area_avg")
+            stats = df["unit_area_avg"]
+            print(f"    unit_area_avg: mean={stats.mean():.2f}, median={stats.median():.2f}")
+
+        # 2) 대형 수치 로그 변환 (비선형 스케일 조정)
+        log_targets = {
+            "k-전체세대수": "log_전체세대수",
+            "k-연면적": "log_연면적",
+        }
+        for orig_col, log_col in log_targets.items():
+            if orig_col in df.columns:
+                val = pd.to_numeric(df[orig_col], errors="coerce").fillna(0)
+                df[log_col] = np.log1p(val.clip(lower=0))
+                created.append(log_col)
+                print(f"    {log_col}: range=[{df[log_col].min():.2f}, {df[log_col].max():.2f}]")
+
+        print(f"  생성된 품질 피처 ({len(created)}개): {created}")
+        return df
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        print("  학습 데이터:")
+        ctx.X_train = self._add_features(ctx.X_train)
+        print("  테스트 데이터:")
+        ctx.X_test = self._add_features(ctx.X_test)
         print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
         return ctx
 
@@ -1460,34 +1655,42 @@ class TargetLogTransformStep(PreprocessingStep):
 # Step 8.5: 저중요도 피처 제거
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class LowImportanceFeatureRemovalStep(PreprocessingStep):
-    """피처 중요도가 극히 낮은 컬럼을 제거하여 노이즈를 줄입니다.
+    """피처 중요도가 극히 낮은 컬럼과 Feature Diet 대상 컬럼을 제거합니다.
 
-    이전 학습 결과의 feature importance에서 중요도 < 50인 피처들을 제거합니다.
-    config.low_importance_cols에 제거 대상 리스트가 관리됩니다.
+    두 가지 제거 대상:
+        1. config.low_importance_cols: 중요도 < 50인 피처 (이전 학습 결과 기반)
+        2. config.feature_diet_cols: 과적합 유발 노이즈 피처 (Exp07 Feature Diet)
+           (예: 계약일, 주차대수 원본 등 — 파생 피처로 대체된 원본 컬럼)
     """
 
     @property
     def name(self) -> str:
-        return "Step 8.5: 저중요도 피처 제거"
+        return "Step 8.5: 저중요도 피처 + Feature Diet 제거"
 
     @staticmethod
-    def _remove(df: pd.DataFrame, cols_to_remove: list[str]) -> pd.DataFrame:
+    def _remove(df: pd.DataFrame, cols_to_remove: list[str], label: str = "") -> pd.DataFrame:
         existing = [c for c in cols_to_remove if c in df.columns]
         if existing:
             df = df.drop(columns=existing, errors="ignore")
-            print(f"    제거된 컬럼 ({len(existing)}개): {existing}")
+            print(f"    제거된 컬럼{label} ({len(existing)}개): {existing}")
         else:
-            print("    제거할 컬럼 없음")
+            print(f"    제거할 컬럼{label} 없음")
         return df
 
     def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
-        cols = ctx.config.low_importance_cols
-        print(f"  제거 대상: {len(cols)}개")
+        low_cols = list(ctx.config.low_importance_cols)
+        diet_cols = list(getattr(ctx.config, "feature_diet_cols", []))
+        all_cols = list(dict.fromkeys(low_cols + diet_cols))
+
+        print(f"  저중요도 제거 대상: {len(low_cols)}개")
+        print(f"  Feature Diet 제거 대상: {len(diet_cols)}개")
+        print(f"  총 제거 대상: {len(all_cols)}개 (중복 제외)")
+
         print("  학습 데이터:")
-        ctx.X_train = self._remove(ctx.X_train, cols)
+        ctx.X_train = self._remove(ctx.X_train, all_cols)
         print("  테스트 데이터:")
-        ctx.X_test = self._remove(ctx.X_test, cols)
+        ctx.X_test = self._remove(ctx.X_test, all_cols)
         # 범주형 목록에서도 제거
-        ctx.categorical_cols = [c for c in ctx.categorical_cols if c not in cols]
+        ctx.categorical_cols = [c for c in ctx.categorical_cols if c not in all_cols]
         print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
         return ctx
