@@ -37,6 +37,8 @@ class ModelConfig:
         n_splits: K-Fold 분할 수
         random_state: 재현성을 위한 시드
         use_log_target: log1p 변환된 타겟 사용 여부
+        cv_strategy: 교차 검증 전략 ("kfold" | "timeseries")
+        use_sample_weight: 시간 기반 샘플 가중치 사용 여부
     """
 
     # ── 경로 설정 ──
@@ -57,9 +59,23 @@ class ModelConfig:
     # ── 교차 검증 설정 ──
     n_splits: int = 5
     random_state: int = 42
+    cv_strategy: str = "kfold"  # "kfold" | "timeseries"
 
     # ── 타겟 변환 ──
     use_log_target: bool = True
+
+    # ── 시간 기반 Sample Weight ──
+    use_sample_weight: bool = True
+    sample_weight_decay: float = 0.05  # 지수 감쇠 계수
+
+    # ── Fold 내 Target Encoding ──
+    use_fold_target_encoding: bool = True
+    target_encode_cols: list[str] = field(
+        default_factory=lambda: [
+            "아파트명", "도로명", "번지", "시군구", "구", "동",
+        ]
+    )
+    target_encode_smoothing: int = 100
 
     # ── LightGBM 하이퍼파라미터 ──
     lgbm_params: dict = field(default_factory=lambda: {
@@ -80,8 +96,49 @@ class ModelConfig:
         "verbose": -1,
     })
 
+    # ── XGBoost 하이퍼파라미터 ──
+    xgb_params: dict = field(default_factory=lambda: {
+        "objective": "reg:squarederror",
+        "eval_metric": "rmse",
+        "n_estimators": 5000,
+        "learning_rate": 0.05,
+        "max_depth": 8,
+        "min_child_weight": 20,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 0.1,
+        "reg_lambda": 1.0,
+        "tree_method": "hist",
+        "device": "cuda",
+        "random_state": 42,
+        "n_jobs": -1,
+        "verbosity": 0,
+    })
+
+    # ── CatBoost 하이퍼파라미터 ──
+    catboost_params: dict = field(default_factory=lambda: {
+        "iterations": 5000,
+        "learning_rate": 0.03,
+        "depth": 6,
+        "l2_leaf_reg": 5.0,
+        "random_strength": 0.5,
+        "bagging_temperature": 0.8,
+        "random_seed": 42,
+        "task_type": "GPU",
+        "devices": "0",
+        "verbose": 200,
+        "loss_function": "RMSE",
+        "eval_metric": "RMSE",
+    })
+
     # ── Early Stopping ──
     early_stopping_rounds: int = 100
 
     # ── 범주형 피처 (자동 감지 또는 수동 지정) ──
     categorical_features: list[str] | None = None
+
+    # ── 앙상블 설정 ──
+    # 3개 모델 앙상블: 모델 다양성이 높을수록 일반화 성능 향상
+    ensemble_models: list[str] = field(
+        default_factory=lambda: ["lightgbm", "xgboost", "catboost"]
+    )

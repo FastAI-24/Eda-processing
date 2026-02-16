@@ -103,6 +103,31 @@ class PreprocessingConfig:
     )
     target_encode_smoothing: int = 100
 
+    # ── 버스/지하철 거리 피처 ──
+    bus_feature_file: str = "bus_feature.csv"
+    subway_feature_file: str = "subway_feature.csv"
+    transit_bus_radius_m: float = 500.0
+    transit_subway_radius_m: float = 1000.0
+
+    # ── 저중요도 피처 제거 ──
+    low_importance_cols: list[str] = field(
+        default_factory=lambda: [
+            "관리비 업로드", "k-난방방식", "경비비관리형태",
+            "k-단지분류_아파트_주상복합등등_", "사용허가여부",
+            "청소비관리형태", "기타/의무/임대/임의_1/2/3/4",
+            "세대전기계약방법", "k-관리방식", "k-복도유형",
+        ]
+    )
+
+    # ── 원격 서버 프리셋 (GPU/대용량 RAM) ──
+    @classmethod
+    def remote_server_preset(cls) -> "PreprocessingConfig":
+        """원격 GPU 서버(251GB RAM, 64코어)에 최적화된 설정."""
+        return cls(
+            knn_sample_size=30_000,
+            knn_chunk_size=50_000,
+        )
+
     # ── Kakao API ──
     kakao_api_key: str = field(default_factory=lambda: os.environ.get("KAKAO_API_KEY", ""))
     kakao_delay_sec: float = 0.15
@@ -116,3 +141,5 @@ class PreprocessingConfig:
                 self.kakao_api_key = os.environ.get("KAKAO_API_KEY", "")
         except ImportError:
             pass
+
+        # 원격 서버 자동 감지 (KNN 파라미터는 기본값 유지 — 트리 모델이 결측 자체 처리)

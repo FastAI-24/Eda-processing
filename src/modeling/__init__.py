@@ -20,8 +20,10 @@ LightGBM 기반 K-Fold 교차 검증 학습 및 RMSE 평가를 수행합니다.
 
 from .base import BaseModel, TrainingResult
 from .config import ModelConfig
-from .models import LightGBMModel
+from .ensemble import EnsembleTrainer
+from .models import CatBoostModel, LightGBMModel, XGBoostModel
 from .trainer import Trainer
+from .tuner import HyperparameterTuner
 
 __all__ = [
     "ModelConfig",
@@ -29,4 +31,8 @@ __all__ = [
     "TrainingResult",
     "Trainer",
     "LightGBMModel",
+    "XGBoostModel",
+    "CatBoostModel",
+    "EnsembleTrainer",
+    "HyperparameterTuner",
 ]

@@ -37,6 +37,7 @@ from .steps import (
     FloatToIntConversionStep,
     IdentifyCategoricalColumnsStep,
     InteractionFeaturesStep,
+    LowImportanceFeatureRemovalStep,
     MissingIndicatorStep,
     MissingValueImputerStep,
     OutlierClippingStep,
@@ -48,6 +49,7 @@ from .steps import (
     TargetLogTransformStep,
     TargetSeparationStep,
     TemporalFeaturesStep,
+    TransitFeaturesStep,
 )
 
 
@@ -169,19 +171,25 @@ class PreprocessingPipeline:
             Step 1   → Target 분리
             Step 2   → 고결측 컬럼 제거
             Step 2.5 → Float→Int64 타입 변환
-            Step 3   → 컬럼명 정리
+            Step 3   → 컬럼명 정리 (LightGBM 호환)
             Step 3.5 → 날짜/주소 파생 피처
             Step 3.7 → 시간 파생 피처 (계약년/월/분기/반기 + cyclical)
             Step 4   → 범주형 컬럼 식별
             Step 5   → 결측 지표 피처
-            Step 6   → 좌표 보간
+            Step 6   → 좌표 보간 (Kakao API + 시군구 평균)
             Step 6.5 → 공간 파생 피처 (랜드마크 거리)
-            Step 7   → 결측값 대체 (KNN Imputer)
+            Step 6.7 → 버스/지하철 거리 피처 (BallTree)
+            Step 7   → 결측값 대체 (Median Imputer)
             Step 7.5 → 세대당 주차대수
-            Step 7.7 → 교호작용 피처 (면적×층, 비율 등)
-            Step 7.8 → Target Encoding (Bayesian Smoothed)
-            Step 8   → 이상치 클리핑
+            Step 7.7 → 교호작용/도메인 피처
+                       (면적×층, 비율, 재건축 후보, 층구간, 면적대)
+            Step 8   → 이상치 클리핑 (학습 IQR → 테스트 동일 적용)
+            Step 8.5 → 저중요도 피처 제거
             Step 9   → Target 로그 변환
+
+        Note:
+            TargetEncodingStep은 CV 누수 방지를 위해 전처리에서 제외.
+            trainer.py에서 각 Fold 내부에서 TE를 수행합니다.
         """
         pipeline = cls(config=config)
         pipeline.add_step(FilterCancelledTransactionsStep())
@@ -190,15 +198,16 @@ class PreprocessingPipeline:
         pipeline.add_step(FloatToIntConversionStep())
         pipeline.add_step(SanitizeColumnNamesStep())
         pipeline.add_step(DateAddressFeaturesStep())
-        pipeline.add_step(TemporalFeaturesStep())            # NEW: 시간 피처
+        pipeline.add_step(TemporalFeaturesStep())
         pipeline.add_step(IdentifyCategoricalColumnsStep())
         pipeline.add_step(MissingIndicatorStep())
         pipeline.add_step(CoordinateInterpolationStep())
-        pipeline.add_step(SpatialFeaturesStep())              # NEW: 공간 피처
+        pipeline.add_step(SpatialFeaturesStep())
+        pipeline.add_step(TransitFeaturesStep())
         pipeline.add_step(MissingValueImputerStep())
         pipeline.add_step(ParkingPerHouseholdStep())
-        pipeline.add_step(InteractionFeaturesStep())           # NEW: 교호작용 피처
-        pipeline.add_step(TargetEncodingStep())                # NEW: 타겟 인코딩
-        pipeline.add_step(OutlierClippingStep())
+        pipeline.add_step(InteractionFeaturesStep())          # 교호작용 + 도메인 피처
+        pipeline.add_step(OutlierClippingStep())              # 학습/테스트 동일 범위 클리핑
+        pipeline.add_step(LowImportanceFeatureRemovalStep())
         pipeline.add_step(TargetLogTransformStep())
         return pipeline
