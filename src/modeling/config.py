@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -118,16 +119,18 @@ class ModelConfig:
 
     # ── CatBoost 하이퍼파라미터 ──
     catboost_params: dict = field(default_factory=lambda: {
-        "iterations": 5000,
-        "learning_rate": 0.03,
-        "depth": 6,
-        "l2_leaf_reg": 5.0,
-        "random_strength": 0.5,
-        "bagging_temperature": 0.8,
+        "iterations": 10000,
+        "learning_rate": 0.05,
+        "depth": 8,
+        "l2_leaf_reg": 3.0,
+        "random_strength": 0.3,
+        "bagging_temperature": 0.5,
+        "border_count": 128,
+        "min_data_in_leaf": 20,
         "random_seed": 42,
         "task_type": "GPU",
         "devices": "0",
-        "verbose": 200,
+        "verbose": 500,
         "loss_function": "RMSE",
         "eval_metric": "RMSE",
     })
@@ -143,3 +146,65 @@ class ModelConfig:
     ensemble_models: list[str] = field(
         default_factory=lambda: ["lightgbm", "xgboost", "catboost"]
     )
+
+    # ── 튜닝 파라미터 자동 적용 ──
+
+    def apply_tuned_params(self, params_path: Path | str | None = None) -> bool:
+        """저장된 Optuna 최적 파라미터를 기본값에 오버라이드합니다.
+
+        Args:
+            params_path: JSON 파일 경로. None이면 output_dir/optuna_best_params.json 사용.
+
+        Returns:
+            True: 파라미터가 적용된 경우
+            False: 파일이 없거나 적용 실패한 경우
+        """
+        if params_path is None:
+            params_path = self.output_dir / "optuna_best_params.json"
+        else:
+            params_path = Path(params_path)
+
+        if not params_path.exists():
+            print(f"튜닝 파라미터 파일 없음: {params_path}")
+            return False
+
+        with open(params_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        # 메타 정보 키는 제외
+        _META_KEYS = {"tuning_meta"}
+        # cv_rmse 등 학습 파라미터가 아닌 키
+        _EXCLUDE_PARAM_KEYS = {"cv_rmse"}
+
+        applied = []
+
+        if "lightgbm" in data and "lightgbm" not in _META_KEYS:
+            lgbm_tuned = {
+                k: v for k, v in data["lightgbm"].items()
+                if k not in _EXCLUDE_PARAM_KEYS
+            }
+            self.lgbm_params.update(lgbm_tuned)
+            applied.append("lightgbm")
+
+        if "xgboost" in data and "xgboost" not in _META_KEYS:
+            xgb_tuned = {
+                k: v for k, v in data["xgboost"].items()
+                if k not in _EXCLUDE_PARAM_KEYS
+            }
+            self.xgb_params.update(xgb_tuned)
+            applied.append("xgboost")
+
+        if "catboost" in data and "catboost" not in _META_KEYS:
+            cb_tuned = {
+                k: v for k, v in data["catboost"].items()
+                if k not in _EXCLUDE_PARAM_KEYS
+            }
+            self.catboost_params.update(cb_tuned)
+            applied.append("catboost")
+
+        if applied:
+            print(f"튜닝 파라미터 적용: {', '.join(applied)} ({params_path.name})")
+            return True
+
+        print("적용할 튜닝 파라미터 없음")
+        return False

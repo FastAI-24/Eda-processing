@@ -60,14 +60,18 @@ class HyperparameterTuner:
             "metric": "rmse",
             "boosting_type": "gbdt",
             "n_estimators": 5000,
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 31, 255),
-            "max_depth": trial.suggest_int("max_depth", 5, 15),
-            "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
-            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.15, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 31, 512),
+            "max_depth": trial.suggest_int("max_depth", -1, 12),
+            "min_child_samples": trial.suggest_int("min_child_samples", 10, 200),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+            "min_child_weight": trial.suggest_float("min_child_weight", 1e-3, 10.0, log=True),
+            "subsample_freq": trial.suggest_int("subsample_freq", 0, 5),
+            "path_smooth": trial.suggest_float("path_smooth", 0.0, 10.0),
+            "feature_fraction_bynode": trial.suggest_float("feature_fraction_bynode", 0.5, 1.0),
             "random_state": 42,
             "n_jobs": -1,
             "verbose": -1,
@@ -117,11 +121,14 @@ class HyperparameterTuner:
         params = {
             "objective": "reg:squarederror",
             "n_estimators": 5000,
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.15, log=True),
             "max_depth": trial.suggest_int("max_depth", 4, 12),
-            "min_child_weight": trial.suggest_int("min_child_weight", 5, 100),
-            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 100),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
+            "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.5, 1.0),
+            "colsample_bynode": trial.suggest_float("colsample_bynode", 0.5, 1.0),
+            "gamma": trial.suggest_float("gamma", 0.0, 5.0),
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
             "tree_method": "hist",
@@ -168,12 +175,17 @@ class HyperparameterTuner:
 
         params = {
             "iterations": 5000,
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.15, log=True),
             "depth": trial.suggest_int("depth", 4, 10),
-            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-8, 10.0, log=True),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 10.0),
+            "random_strength": trial.suggest_float("random_strength", 0.0, 2.0),
+            "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 2.0),
+            "border_count": trial.suggest_int("border_count", 32, 255),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 1, 100),
             "random_seed": 42,
             "verbose": 0,
             "loss_function": "RMSE",
+            "eval_metric": "RMSE",
         }
 
         # GPU 사용 시도
@@ -183,6 +195,9 @@ class HyperparameterTuner:
             if result.returncode == 0:
                 params["task_type"] = "GPU"
                 params["devices"] = "0"
+                # GPU 모드에서 border_count > 254 시 OOM 가능
+                if params["border_count"] > 254:
+                    params["border_count"] = 254
         except Exception:
             pass
 
@@ -243,9 +258,11 @@ class HyperparameterTuner:
             n_trials: 탐색 횟수
 
         Returns:
-            best_params: 최적 하이퍼파라미터 딕셔너리
+            best_params: 최적 하이퍼파라미터 딕셔너리 (cv_rmse 포함)
         """
         import optuna
+        from optuna.samplers import TPESampler
+
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
         cfg = self._config
@@ -274,10 +291,27 @@ class HyperparameterTuner:
         print(f"\n{'='*60}")
         print(f"Optuna 하이퍼파라미터 탐색: {model_name}")
         print(f"  n_trials={n_trials}, n_splits={cfg.n_splits}, cv={cfg.cv_strategy}")
+        print(f"  Sampler: TPE (seed={cfg.random_state})")
+        print(f"  Pruner: MedianPruner (startup=10)")
         print(f"{'='*60}")
 
+        sampler = TPESampler(
+            seed=cfg.random_state,
+            multivariate=True,
+        )
+        pruner = optuna.pruners.MedianPruner(
+            n_startup_trials=10,
+            n_warmup_steps=100,
+            interval_steps=10,
+        )
+
         start = time.time()
-        study = optuna.create_study(direction="minimize")
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=sampler,
+            pruner=pruner,
+            study_name=f"{model_name}_tuning",
+        )
         study.optimize(
             lambda trial: objective_fn(trial, X, y_transformed, cat_features),
             n_trials=n_trials,
@@ -287,8 +321,11 @@ class HyperparameterTuner:
 
         print(f"\n탐색 완료 ({elapsed:.1f}초)")
         print(f"  최적 RMSE: {study.best_value:.6f}")
+        print(f"  완료/전체: {len(study.trials)}/{n_trials} trials")
         print(f"  최적 파라미터:")
         for key, val in study.best_params.items():
             print(f"    {key}: {val}")
 
-        return study.best_params
+        result = dict(study.best_params)
+        result["cv_rmse"] = study.best_value
+        return result
