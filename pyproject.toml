@@ -1,13 +1,26 @@
 [project]
 name = "house-price-prediction"
 version = "0.1.0"
-description = "아파트 가격 예측 ML 프로젝트 - LightGBM GPU 모델"
-readme = "README.md"
-requires-python = ">=3.10,<3.11"
+description = "서울 아파트 실거래가 예측 프로젝트"
+requires-python = ">=3.12, <3.13"
 dependencies = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.2",
+    "pandas>=3.0.0",
+    "plt>=0.2.0",
+    "python-dotenv>=1.2.1",
+    "scikit-learn>=1.8.0",
+    "seaborn>=0.13.2",
+    "tqdm>=4.67.3",
     "lightgbm>=4.0.0",
-    "numpy>=1.23.5,<2.0",
-    "optuna>=3.5.0",
-    "pandas>=1.5.3,<3.0",
-    "scikit-learn>=1.2.2",
+    "xgboost>=2.0.0",
+    "catboost>=1.2.0",
+    "optuna>=3.0.0",
 ]
+
+[project.scripts]
+preprocess = "preprocessing.run_preprocessing:main"
+train = "modeling.run_training:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
