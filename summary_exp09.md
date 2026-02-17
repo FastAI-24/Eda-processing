@@ -1,15 +1,20 @@
-# Experiment 09: Macro Economics Boost + All Data + Time Decay
-**Date**: 2026-02-16
-**Goal**: Overcome price plateaus by introducing macro-economic context and utilizing historical data with decay weights.
+# Experiment 09: Macro Economics Boost - 거시 경제 컨텍스트와 시간 가중치 도입
 
-## 1. Methodology
-- **Data**: All historical data (2007-2023) restored.
-- **Macro Feature**: Added BOK Base Rate (기준금리) matched by year/month.
-- **Weighting**: Applied `exp((year - 2023) * 0.1)` to prioritize recent trends while keeping historical spatial premiums.
-- **Integrated Features**: Quality features (Exp07) + Spatial Clusters (Exp08).
-## 2. Expected Results
-- Introduction of 'Interest Rates' provides the missing link between time and price fluctuation.
-- Historical data stabilizes the 'Location Premium' (Cluster Mean Price).
+**날짜**: 2026-02-16
+**목표**: 가격 정체기(Plateau)를 돌파하기 위해 거시 경제 지표(금리)를 도입하고, 과거 데이터를 시간 가중치(Time Decay)와 함께 활용하여 모델에 '인과관계'를 부여한다.
 
-## 3. Conclusion
-- Moving from 'Where' to 'Why' - providing causal context to the model.
+## 1. 방법론 (Methodology)
+
+- **데이터 활용**: 2007~2023 전 기간 데이터 활용 (인근 좌표 기반 결측치 복구 데이터 포함).
+- **매크로 변수**: 한국은행 기준금리 데이터를 연/월별로 매칭하여 추가.
+- **시간 가중치 (Weighting)**: `exp((year - 2023) * 0.1)` 공식을 적용하여 최신 트렌드를 우선하되, 과거의 공간적 프리미엄은 학습에 유지.
+- **변수 통합**: Exp07의 품질 변수와 Exp08의 공간 클러스터링(K=150) 정보를 모두 통합.
+
+## 2. 결과 및 기대 효과 (Results)
+
+- **금리 변수 도입**: 시간의 흐름과 가격 변동 사이의 누락된 연결 고리(인과관계)를 제공함.
+- **공간 프리미엄 안정화**: 전체 데이터를 활용함으로써 지역별(클러스터별) 평균 가격에 대한 통계적 신뢰도가 높아짐.
+
+## 3. 결론 (Conclusion)
+
+- '입지(Where)'를 넘어 '이유(Why)'에 대한 컨텍스트를 모델에게 제공. 단순 추세 추종이 아닌 경제적 배경을 고려한 예측 모델로 진화.

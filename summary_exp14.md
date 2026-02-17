@@ -1,14 +1,20 @@
-# Experiment 14: Honest Validation (Time Split)
-**Date**: 2026-02-17 03:44
-**Goal**: Establish a validation strategy that correlates with the Leaderboard by using Time-based Split.
+# Experiment 14: Honest Validation (Time Split) - 리더보드와 연동되는 정직한 검증
 
-## 1. Methodology
-- **Split Strategy**: Train (~2023.03) / Valid (2023.04~2023.06).
-- **Model**: LightGBM (Exp12-v2 Features + Log Target).
-- **Rationale**: Shuffle Split leaked future information within clusters. Time split mimics the forecasting task.
+**날짜**: 2026-02-17 03:44
+**목표**: 리더보드 점수와 상관관계가 높은 검증 세트를 구축하기 위해 시간 기반 분할(Time-based Split) 전략을 도입한다.
 
-## 2. Results
-- **CV RMSE**: ~13,670 (Measured on 2023.04-06 data).
-- **Interpretation**: The large gap between previous CV (~7,000) and LB (~16,000) is addressed. This CV score is a realistic estimate of model performance on unseen future data.
-## 3. Conclusion
-- We now have a trustworthy compass. Improving this CV score should directly improve LB score.
+## 1. 방법론 (Methodology)
+
+- **분할 전략**: 학습 데이터 (~2023.03) / 검증 데이터 (2023.04 ~ 2023.06).
+- **모델**: LightGBM (Exp12-v2 기반 피처 + 타겟 로그 변환).
+- **논리**: 기존 Shuffle Split은 클러스터 내에서 미래 정보를 학습하는 누수가 있었음. Time Split은 실제 예측 환경과 동일하게 '과거로 미래를 맞추는' 구조임.
+
+## 2. 결과 (Results)
+
+- **CV RMSE**: **13,670** (정직한 시계열 검증 점수)
+- **LB RMSE**: **15,651**
+- **해석**: 셔플 방식의 7,000점이라는 허상을 드디어 버리고, 리더보드와 연동되는 현실적인 지표를 확보함.
+
+## 3. 결론 (Conclusion)
+
+- 드디어 신뢰할 수 있는 '나침반'을 확보함. 이제 이 CV 점수를 개선하는 작업이 실제 리더보드 점수 향상으로 직결될 것임.

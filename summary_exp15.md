@@ -1,14 +1,20 @@
-# Experiment 15: Time Decay Weighting Strategy
-**Date**: 2026-02-17 03:50
-**Goal**: Prioritize recent market trends (2022-2023) over historical data using sample weights.
+# Experiment 15: Time Decay Weighting Strategy - 최신 시장 트렌드에 가중치 부여
 
-## 1. Methodology
-- **Validation**: Honest Time-Split (Train ~2023.03 / Valid 2023.04+).
-- **Weighting Scheme**: 2023 (2.0x), 2022 (1.5x), Others (1.0x).
-- **Model**: LightGBM (Low Learning Rate for Stability).
+**날짜**: 2026-02-17 03:50
+**목표**: 하락장과 보합세가 섞인 최근(2022~2023)의 시장 트렌드를 모델이 더 민감하게 학습하도록 샘플 가중치를 적용한다.
 
-## 2. Results
-- **CV RMSE**: **13,176** (Improved from Exp14's 13,670).
-- **Interpretation**: The model successfully captured the downward price trend of 2022-2023. This is the most realistic and performant model so far.
-## 3. Next Steps
-- Save submission chance. Proceed to Stacking/Ensemble locally to push CV below 13,000.
+## 1. 방법론 (Methodology)
+
+- **검증 전략**: 정직한 시간 분할 (Train ~2023.03 / Valid 2023.04+).
+- **가중치 설계**: 2023년 거래(2.0배), 2022년 거래(1.5배), 그 외 과거(1.0배)로 설정.
+- **모델**: LightGBM (안정성을 위해 낮은 학습률 적용).
+
+## 2. 결과 (Results)
+
+- **CV RMSE**: **13,176** (Exp14 대비 약 500점 향상)
+- **LB RMSE**: **15,651** (단일 모델의 상한선 도달)
+- **해석**: 최신 트렌드 가중치가 CV를 낮추는 데는 매우 효과적이었으나, 리더보드 점수 하락으로 이어지기 위해서는 단일 모델을 넘어선 모델 다양성(앙상블)이 필요함을 시사함.
+
+## 3. 향후 계획 (Next Steps)
+
+- 로컬 검증 점수가 13,000점 이하로 내려갈 때까지 스태킹(Stacking) 및 앙상블 전략을 고도화할 예정.

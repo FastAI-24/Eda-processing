@@ -1,14 +1,20 @@
-# Experiment 11: Top Brand Isolation Proof
-**Date**: 2026-02-17
-**Goal**: Prove the standalone benefit of `is_top_brand` feature by adding it to the Exp08 baseline and removing interest rate context.
+# Experiment 11: Top Brand Isolation Proof - 브랜드 변수의 단독 효과 검증
 
-## 1. Methodology
-- **Baseline**: Exp08 (Recent Data + Clusters + Quality).
-- **Change**: Added `is_top_brand` (10 major construction companies).
-- **Isolation**: No Macro features, No weighting additions.
-## 2. Results
-- **CV RMSE**: **7,303** (Exp08 CV was in the same range).
-- **Status**: Successfully isolated the brand feature. Needs LB verification to confirm improvement over 15,642.
+**날짜**: 2026-02-17
+**목표**: 금리 등 외부 변수를 배제하고, Exp08 베이스라인에 `is_top_brand` 변수만 추가하여 이 변수가 순수하게 성능 향상에 기여하는지 증명한다.
 
-## 3. Conclusion
-- The model has been cleaned of experimental noise. This submission will purely prove if 'Brand' is a winning feature.
+## 1. 방법론 (Methodology)
+
+- **베이스라인**: Exp08 (최신 데이터 + 클러스터링 + 품질 변수).
+- **변경 사항**: 10대 건설사 여부를 나타내는 `is_top_brand` 변수 추가.
+- **변인 통제**: 실험의 순수성을 위해 금리 변수나 새로운 시간 가중치 전략은 적용하지 않음.
+
+## 2. 결과 (Results)
+
+- **CV RMSE**: 7,303
+- **LB RMSE**: **16,314**
+- **해석**: 브랜드 변수 단독으로는 이전 베이스라인을 넘지 못함. 여전히 교통 피처가 누락된 상태였으며, 서울 부동산에서는 브랜드라는 '이름값'보다 실제 입지(교통)가 훨씬 강력한 요인임을 재확인함.
+
+## 3. 결론 (Conclusion)
+
+- 실험적 노이즈를 제거한 '가장 깨끗한' 상태의 최신 모델. 이번 제출을 통해 '브랜드' 정보가 리더보드 점수 향상의 핵심 키(Winning Feature)가 될 수 있는지 판가름할 예정.
