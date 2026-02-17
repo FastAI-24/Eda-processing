@@ -109,6 +109,12 @@ class PreprocessingConfig:
     transit_bus_radius_m: float = 500.0
     transit_subway_radius_m: float = 1000.0
 
+    # ── 최신 데이터 필터링 (Exp06) ──
+    recent_data_year_from: int | None = 2017
+
+    # ── 공간 클러스터링 (Exp08) ──
+    spatial_n_clusters: int = 150
+
     # ── 저중요도 피처 제거 ──
     low_importance_cols: list[str] = field(
         default_factory=lambda: [
@@ -116,6 +122,15 @@ class PreprocessingConfig:
             "k-단지분류_아파트_주상복합등등_", "사용허가여부",
             "청소비관리형태", "기타/의무/임대/임의_1/2/3/4",
             "세대전기계약방법", "k-관리방식", "k-복도유형",
+        ]
+    )
+
+    # ── Feature Diet (Exp07) ──
+    # 파생 피처로 대체된 원본 컬럼을 제거하여 과적합 방지
+    feature_diet_cols: list[str] = field(
+        default_factory=lambda: [
+            "계약일",
+            "주차대수",
         ]
     )
 
