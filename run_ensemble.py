@@ -124,6 +124,9 @@ def main(
     if use_pseudo_labeling:
         config.use_pseudo_labeling = True
 
+    # 개별 모델 성능 향상: Optuna 튜닝 결과 자동 적용
+    config.apply_tuned_params()
+
     print(f"\n{'━'*60}")
     print(f"  🚀 House Price Prediction — 앙상블 학습 파이프라인")
     print(f"{'━'*60}")
