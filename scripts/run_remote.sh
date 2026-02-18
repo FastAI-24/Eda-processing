@@ -9,6 +9,7 @@
 #   ./scripts/run_remote.sh --preprocess-only  # 전처리만
 #   ./scripts/run_remote.sh --train-only       # 학습만 (전처리된 데이터 필요)
 #   ./scripts/run_remote.sh --ensemble         # 앙상블 학습
+#   ./scripts/run_remote.sh --download-only   # 결과만 다운로드 (앙상블 완료 후)
 #   ./scripts/run_remote.sh --tune             # Optuna 하이퍼파라미터 튜닝
 #   ./scripts/run_remote.sh --setup            # 환경 설치만
 # ─────────────────────────────────────────────────────────────
@@ -49,12 +50,13 @@ case "${1:-}" in
     --preprocess-only) MODE="preprocess" ;;
     --train-only)      MODE="train" ;;
     --ensemble)        MODE="ensemble" ;;
+    --download-only)   MODE="download" ;;
     --tune)            MODE="tune" ;;
     --setup)           MODE="setup" ;;
     "")                MODE="full" ;;
     *)
         log_error "알 수 없는 옵션: $1"
-        echo "사용법: $0 [--preprocess-only|--train-only|--ensemble|--tune|--setup]"
+        echo "사용법: $0 [--preprocess-only|--train-only|--ensemble|--download-only|--tune|--setup]"
         exit 1
         ;;
 esac
@@ -76,6 +78,25 @@ if [ "${MODE}" = "setup" ]; then
     log_info "원격 서버 환경 설치 중..."
     ${SSH_CMD} 'bash -s' < "${SCRIPT_DIR}/setup_remote_env.sh"
     log_info "환경 설치 완료!"
+    exit 0
+fi
+
+# ── Step 2.5: 다운로드만 (--download-only) ──
+if [ "${MODE}" = "download" ]; then
+    log_info "결과 다운로드만 수행..."
+    LOCAL_OUTPUT="${PROJECT_ROOT}/outputs"
+    mkdir -p "${LOCAL_OUTPUT}"
+    for f in submission.csv feature_importance_lightgbm.csv feature_importance_xgboost.csv feature_importance_catboost.csv preprocess.log train.log ensemble.log tuning.log; do
+        ${SCP_CMD} "${SSH_USER}@${SSH_HOST}:${REMOTE_PROJECT}/outputs/${f}" "${LOCAL_OUTPUT}/" 2>/dev/null || true
+    done
+    for f in X_train_preprocessed.csv X_test_preprocessed.csv y_train_preprocessed.csv; do
+        if ${SSH_CMD} "test -f ${REMOTE_PROJECT}/notebooks/data/${f}" 2>/dev/null; then
+            log_info "전처리 데이터 다운로드: ${f}"
+            ${SCP_CMD} "${SSH_USER}@${SSH_HOST}:${REMOTE_PROJECT}/notebooks/data/${f}" "${PROJECT_ROOT}/notebooks/data/" 2>/dev/null || true
+        fi
+    done
+    log_info "다운로드 완료!"
+    ls -lh "${LOCAL_OUTPUT}/"*.csv 2>/dev/null || echo "  CSV 파일 없음"
     exit 0
 fi
 
