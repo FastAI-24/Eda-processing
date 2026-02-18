@@ -19,6 +19,7 @@ LightGBM, XGBoost, CatBoost의 예측을 다음 전략으로 결합합니다:
 
 from __future__ import annotations
 
+import gc
 import time
 
 import numpy as np
@@ -119,11 +120,16 @@ class EnsembleTrainer:
                         test_list.append(result.test_predictions)
                     fold_scores_list.append(result.fold_scores)
                     if n_seeds == 1:
+                        result.trained_models = []
                         results[model_key] = result
                         model_bar.set_postfix_str(f"{model_key.upper()} RMSE={result.mean_rmse:.6f}")
                 except Exception as e:
                     tqdm.write(f"  ❌ {model_key} (seed={seed}) 학습 실패: {e}")
                     continue
+
+            # 학습 완료 후 Trainer/모델 객체 메모리 해제 (OOM 방지)
+            del trainer
+            gc.collect()
 
             if not oof_list:
                 continue
