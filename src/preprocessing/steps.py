@@ -292,14 +292,17 @@ class TemporalFeaturesStep(PreprocessingStep):
         - 계약분기: 분기 (1~4)
         - 계약반기: 반기 (1~2)
         - 계약월_sin, 계약월_cos: 월의 순환 인코딩 (12월→1월 연속성)
+        - days_since: 2007-01-01부터 경과일 (연속형 시간 추세)
     """
+
+    EPOCH = pd.Timestamp("2007-01-01")
 
     @property
     def name(self) -> str:
         return "Step 3.7: 시간 파생 피처"
 
-    @staticmethod
-    def _add_features(df: pd.DataFrame) -> pd.DataFrame:
+    @classmethod
+    def _add_features(cls, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         created: list[str] = []
 
@@ -315,6 +318,18 @@ class TemporalFeaturesStep(PreprocessingStep):
             df["계약월_cos"] = np.cos(2 * np.pi * month_float / 12)
 
             created.extend(["계약년", "계약월", "계약분기", "계약반기", "계약월_sin", "계약월_cos"])
+
+            # days_since: 2007-01-01부터 경과일 (선형적 시간 추세 학습용)
+            day_col = "계약일" if "계약일" in df.columns else None
+            ym_str = df["계약년월"].astype(str)
+            if day_col is not None:
+                day_str = df[day_col].astype(str).str.zfill(2)
+            else:
+                day_str = "15"  # 일자 정보 없으면 월 중순 가정
+            date_str = ym_str.str[:4] + "-" + ym_str.str[4:6] + "-" + day_str
+            dates = pd.to_datetime(date_str, errors="coerce")
+            df["days_since"] = (dates - cls.EPOCH).dt.days.fillna(0).astype("float64")
+            created.append("days_since")
 
         print(f"  생성된 시간 피처 ({len(created)}개): {created}")
         return df
@@ -619,16 +634,17 @@ class SpatialFeaturesStep(PreprocessingStep):
     유클리드 거리를 계산하여 지리적 가격 구배를 포착합니다.
 
     생성 피처:
-        - dist_강남역: 강남역까지 거리 (km)
-        - dist_서울시청: 서울시청까지 거리 (km)
-        - dist_여의도: 여의도까지 거리 (km)
+        - dist_강남역: 강남역(GBD)까지 거리 (km)
+        - dist_서울시청: 광화문(CBD)까지 거리 (km)
+        - dist_여의도: 여의도(YBD)까지 거리 (km)
+        - min_dist_to_job: 3대 업무지구 중 최소 거리 (km) — Golden Triangle
     """
 
-    # 주요 랜드마크 좌표 (경도, 위도)
+    # 3대 업무지구 좌표 (경도, 위도) — Golden Triangle
     LANDMARKS: dict[str, tuple[float, float]] = {
-        "강남역": (127.0276, 37.4979),
-        "서울시청": (126.9780, 37.5665),
-        "여의도": (126.9246, 37.5219),
+        "강남역": (127.0276, 37.4979),    # GBD (강남업무지구)
+        "서울시청": (126.9780, 37.5665),  # CBD (광화문)
+        "여의도": (126.9246, 37.5219),    # YBD (여의도)
     }
 
     @property
@@ -657,12 +673,21 @@ class SpatialFeaturesStep(PreprocessingStep):
             lon = df["좌표X"].astype("float64")
             lat = df["좌표Y"].astype("float64")
 
+            dist_cols: list[str] = []
             for name, (ref_lon, ref_lat) in cls.LANDMARKS.items():
                 col_name = f"dist_{name}"
                 df[col_name] = cls._approx_km_distance(lon, lat, ref_lon, ref_lat)
                 created.append(col_name)
+                dist_cols.append(col_name)
                 stats = df[col_name].describe()
                 print(f"    {col_name}: mean={stats['mean']:.2f}km, max={stats['max']:.2f}km")
+
+            # Golden Triangle: 3대 업무지구 중 최소 거리
+            if dist_cols:
+                df["min_dist_to_job"] = df[dist_cols].min(axis=1)
+                created.append("min_dist_to_job")
+                stats = df["min_dist_to_job"].describe()
+                print(f"    min_dist_to_job: mean={stats['mean']:.2f}km, max={stats['max']:.2f}km")
 
         print(f"  생성된 공간 피처 ({len(created)}개): {created}")
         return df
@@ -1974,5 +1999,301 @@ class LowImportanceFeatureRemovalStep(PreprocessingStep):
         ctx.X_test = self._remove(ctx.X_test, all_cols)
         # 범주형 목록에서도 제거
         ctx.categorical_cols = [c for c in ctx.categorical_cols if c not in all_cols]
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 2.3: 다중공선성 제거 (Multicollinearity Removal)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class MulticollinearityRemovalStep(PreprocessingStep):
+    """상관관계가 매우 높은 변수 쌍 중 설명력이 더 낮은 변수를 제거합니다.
+
+    예: 연면적 vs 주거전용면적 (상관계수 0.98) → 연면적 제거.
+    모델 안정성을 확보하고, 불필요한 차원을 줄입니다.
+
+    설정:
+        config.multicollinearity_drop_cols: 제거 대상 컬럼 리스트
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 2.3: 다중공선성 제거"
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        drop_cols = getattr(ctx.config, "multicollinearity_drop_cols", [
+            "k-연면적",
+        ])
+        existing_train = [c for c in drop_cols if c in ctx.X_train.columns]
+        existing_test = [c for c in drop_cols if c in ctx.X_test.columns]
+
+        if existing_train:
+            ctx.X_train = ctx.X_train.drop(columns=existing_train, errors="ignore")
+        if existing_test:
+            ctx.X_test = ctx.X_test.drop(columns=existing_test, errors="ignore")
+
+        print(f"  제거된 컬럼 ({len(existing_train)}개): {existing_train}")
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 5.5: 좌표 이상치 탐지 (서울시 경계)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class CoordinateOutlierDetectionStep(PreprocessingStep):
+    """서울시 경계를 벗어나는 좌표를 NaN으로 처리합니다.
+
+    서울시 경계 범위:
+        경도(X): 126.76 ~ 127.18
+        위도(Y): 37.43 ~ 37.70
+
+    지오코딩 오류나 잘못된 좌표를 사전에 제거하여,
+    이후 좌표 보간 단계에서 정확한 보간이 이루어지도록 합니다.
+    """
+
+    SEOUL_LON_MIN = 126.76
+    SEOUL_LON_MAX = 127.18
+    SEOUL_LAT_MIN = 37.43
+    SEOUL_LAT_MAX = 37.70
+
+    @property
+    def name(self) -> str:
+        return "Step 5.5: 좌표 이상치 탐지 (서울시 경계)"
+
+    @classmethod
+    def _detect_and_nullify(cls, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        if "좌표X" not in df.columns or "좌표Y" not in df.columns:
+            print("    좌표 컬럼 없음 — 건너뜀")
+            return df
+
+        lon = pd.to_numeric(df["좌표X"], errors="coerce")
+        lat = pd.to_numeric(df["좌표Y"], errors="coerce")
+
+        out_of_bounds = (
+            (lon < cls.SEOUL_LON_MIN) | (lon > cls.SEOUL_LON_MAX)
+            | (lat < cls.SEOUL_LAT_MIN) | (lat > cls.SEOUL_LAT_MAX)
+        ) & lon.notna() & lat.notna()
+
+        n_outlier = out_of_bounds.sum()
+        if n_outlier > 0:
+            df.loc[out_of_bounds, "좌표X"] = np.nan
+            df.loc[out_of_bounds, "좌표Y"] = np.nan
+            print(f"    서울 경계 벗어난 좌표: {n_outlier:,}건 → NaN 처리")
+        else:
+            print("    서울 경계 이상치 없음")
+        return df
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        print("  학습 데이터:")
+        ctx.X_train = self._detect_and_nullify(ctx.X_train)
+        print("  테스트 데이터:")
+        ctx.X_test = self._detect_and_nullify(ctx.X_test)
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 6.9: 주차대수 결측 예측 (RandomForest)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class ParkingPredictionStep(PreprocessingStep):
+    """결측된 주차대수를 RandomForest로 예측하여 채워 넣습니다.
+
+    전용면적, 세대수, 건물나이 등을 피처로 사용하여
+    주차대수 결측을 단순 평균이 아닌 모델 기반으로 정교하게 보간합니다.
+
+    데이터 누수 방지:
+        학습 데이터에서 RF를 fit → 테스트 데이터에는 predict만 적용.
+
+    설정:
+        config.parking_prediction_features: RF 입력 피처 리스트
+    """
+
+    DEFAULT_FEATURES = [
+        "전용면적", "k-전체세대수", "k-전체동수", "건물나이", "층",
+    ]
+
+    @property
+    def name(self) -> str:
+        return "Step 6.9: 주차대수 결측 예측 (RandomForest)"
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        target_col = "주차대수"
+        if target_col not in ctx.X_train.columns:
+            print(f"  '{target_col}' 컬럼 없음 — 건너뜀")
+            return ctx
+
+        train_missing = ctx.X_train[target_col].isna().sum()
+        test_missing = ctx.X_test[target_col].isna().sum() if target_col in ctx.X_test.columns else 0
+        total_train = len(ctx.X_train)
+        print(f"  주차대수 결측: 학습 {train_missing:,}/{total_train:,} ({train_missing/total_train*100:.1f}%), 테스트 {test_missing:,}")
+
+        if train_missing == 0 and test_missing == 0:
+            print("  결측 없음 — 건너뜀")
+            return ctx
+
+        features = getattr(ctx.config, "parking_prediction_features", self.DEFAULT_FEATURES)
+        available = [f for f in features if f in ctx.X_train.columns]
+        if len(available) < 2:
+            print(f"  사용 가능한 피처 부족 ({len(available)}개) — 건너뜀")
+            return ctx
+
+        from sklearn.ensemble import RandomForestRegressor
+
+        # 학습 데이터에서 주차대수가 있는 행으로 RF 학습
+        train_known = ctx.X_train[ctx.X_train[target_col].notna()].copy()
+        X_rf = train_known[available].fillna(0).astype("float64")
+        y_rf = train_known[target_col].astype("float64")
+
+        rf = RandomForestRegressor(
+            n_estimators=100,
+            max_depth=10,
+            random_state=42,
+            n_jobs=-1,
+        )
+        rf.fit(X_rf, y_rf)
+
+        # R² 확인
+        r2 = rf.score(X_rf, y_rf)
+        print(f"  RF 학습 R²: {r2:.4f}")
+
+        # Int64 → float64 변환 (RF 예측값 할당을 위해)
+        ctx.X_train[target_col] = ctx.X_train[target_col].astype("float64")
+        if target_col in ctx.X_test.columns:
+            ctx.X_test[target_col] = ctx.X_test[target_col].astype("float64")
+
+        # 학습 데이터 결측 채우기
+        train_mask = ctx.X_train[target_col].isna()
+        if train_mask.any():
+            X_pred = ctx.X_train.loc[train_mask, available].fillna(0).astype("float64")
+            ctx.X_train.loc[train_mask, target_col] = rf.predict(X_pred)
+            print(f"  학습 데이터: {train_mask.sum():,}건 예측 완료")
+
+        # 테스트 데이터 결측 채우기
+        if target_col in ctx.X_test.columns:
+            test_mask = ctx.X_test[target_col].isna()
+            if test_mask.any():
+                X_pred = ctx.X_test.loc[test_mask, available].fillna(0).astype("float64")
+                ctx.X_test.loc[test_mask, target_col] = rf.predict(X_pred)
+                print(f"  테스트 데이터: {test_mask.sum():,}건 예측 완료")
+
+        ctx.train_stats["parking_rf_model"] = rf
+        ctx.train_stats["parking_rf_features"] = available
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 7.65: 브랜드 파생 피처
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class BrandFeatureStep(PreprocessingStep):
+    """아파트명에서 10대 건설사 브랜드 키워드를 추출하여 is_top_brand를 생성합니다.
+
+    대형 건설사 브랜드 아파트는 동일 입지에서도 프리미엄이 존재합니다.
+
+    생성 피처:
+        - is_top_brand: 10대 건설사 브랜드 여부 (0/1)
+    """
+
+    TOP_BRANDS = [
+        "래미안", "자이", "힐스테이트", "e편한세상", "롯데캐슬",
+        "푸르지오", "아이파크", "더샵", "SK뷰", "포레나",
+    ]
+
+    @property
+    def name(self) -> str:
+        return "Step 7.65: 브랜드 파생 피처"
+
+    @classmethod
+    def _add_brand(cls, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        apt_col = "아파트명"
+        if apt_col not in df.columns:
+            print(f"    '{apt_col}' 컬럼 없음 — 건너뜀")
+            return df
+
+        apt_name = df[apt_col].fillna("").astype(str)
+        pattern = "|".join(cls.TOP_BRANDS)
+        df["is_top_brand"] = apt_name.str.contains(pattern, case=False, na=False).astype("int8")
+
+        n_brand = df["is_top_brand"].sum()
+        print(f"    is_top_brand: {n_brand:,}건 ({n_brand / len(df) * 100:.1f}%)")
+        return df
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        print("  학습 데이터:")
+        ctx.X_train = self._add_brand(ctx.X_train)
+        print("  테스트 데이터:")
+        ctx.X_test = self._add_brand(ctx.X_test)
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 8.7: Low Cardinality 범주형 Label Encoding
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class LabelEncodingStep(PreprocessingStep):
+    """범주 개수가 적은 변수에 단순 Label Encoding을 적용합니다.
+
+    단지분류, 복도유형, 난방방식 등 범주 개수가 적은 변수는
+    Target Encoding 대신 단순 Label Encoding을 적용하여 모델 복잡도를 낮춥니다.
+
+    데이터 누수 방지:
+        학습 데이터에서 encoding map 생성 → 테스트에 동일 map 적용.
+        테스트에만 있는 미지 범주는 -1로 인코딩.
+
+    설정:
+        config.label_encode_cols: Label Encoding 대상 컬럼 리스트
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 8.7: Low Cardinality Label Encoding"
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        le_cols = getattr(ctx.config, "label_encode_cols", [])
+        if not le_cols:
+            # 자동 감지: object dtype + 고유값 20개 미만
+            for col in ctx.X_train.columns:
+                if (
+                    ctx.X_train[col].dtype == object
+                    and ctx.X_train[col].nunique() < 20
+                    and col not in getattr(ctx.config, "target_encode_cols", [])
+                ):
+                    le_cols.append(col)
+
+        if not le_cols:
+            print("  Label Encoding 대상 없음 — 건너뜀")
+            return ctx
+
+        label_maps: dict[str, dict[str, int]] = {}
+        encoded: list[str] = []
+
+        for col in le_cols:
+            if col not in ctx.X_train.columns:
+                continue
+
+            # 학습 데이터에서 map 생성
+            unique_vals = sorted(ctx.X_train[col].dropna().unique(), key=str)
+            mapping = {str(v): i for i, v in enumerate(unique_vals)}
+            label_maps[col] = mapping
+
+            # 적용
+            ctx.X_train[col] = (
+                ctx.X_train[col].fillna("__MISSING__").astype(str)
+                .map(mapping).fillna(-1).astype("int32")
+            )
+            if col in ctx.X_test.columns:
+                ctx.X_test[col] = (
+                    ctx.X_test[col].fillna("__MISSING__").astype(str)
+                    .map(mapping).fillna(-1).astype("int32")
+                )
+            encoded.append(col)
+            print(f"    {col}: {len(mapping)}개 범주 → 정수 인코딩")
+
+        ctx.train_stats["label_encoding_maps"] = label_maps
+
+        # 인코딩된 컬럼은 더이상 범주형이 아님
+        ctx.categorical_cols = [c for c in ctx.categorical_cols if c not in encoded]
+
+        print(f"  Label Encoding 완료 ({len(encoded)}개): {encoded}")
         print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
         return ctx
