@@ -944,24 +944,72 @@ class TransitFeaturesStep(PreprocessingStep):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 6.75: 한강 거리 피처 (Exp10 외부 데이터)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class HanRiverDistanceStep(PreprocessingStep):
+    """좌표 기반 한강까지 거리 근사 피처를 생성합니다 (Exp10).
+
+    서울 한강 대략적 위도 37.52°N 기준. 위도 1도 ≈ 111km.
+    dist_to_hangang_km = |위도 - 37.52| * 111 (km)
+
+    생성 피처:
+        - dist_to_hangang_km: 한강까지 거리 (km)
+    """
+
+    HANGANG_LAT = 37.52  # 서울 한강 대략적 위도
+    KM_PER_DEGREE = 111.0
+
+    @property
+    def name(self) -> str:
+        return "Step 6.75: 한강 거리"
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        if not getattr(ctx.config, "use_hangang_distance", True):
+            print("  한강 거리 비활성화 — 건너뜀")
+            return ctx
+
+        lat_col = "좌표Y"  # 한국 좌표: X=경도, Y=위도
+        if lat_col not in ctx.X_train.columns:
+            print(f"  '{lat_col}' 컬럼 없음 — 건너뜀")
+            return ctx
+
+        def _add(df: pd.DataFrame) -> pd.DataFrame:
+            df = df.copy()
+            lat = pd.to_numeric(df[lat_col], errors="coerce").fillna(self.HANGANG_LAT)
+            df["dist_to_hangang_km"] = (
+                np.abs(lat - self.HANGANG_LAT) * self.KM_PER_DEGREE
+            ).fillna(0)
+            return df
+
+        ctx.X_train = _add(ctx.X_train)
+        ctx.X_test = _add(ctx.X_test)
+        print(f"  dist_to_hangang_km: 범위 [{ctx.X_train['dist_to_hangang_km'].min():.2f}, {ctx.X_train['dist_to_hangang_km'].max():.2f}] km")
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Step 6.8: 좌표 기반 공간 클러스터링 (Exp08)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class SpatialClusteringStep(PreprocessingStep):
-    """표준화된 좌표에 K-Means 클러스터링을 적용하여 생활권을 정의합니다 (Exp08).
+    """표준화된 좌표에 클러스터링을 적용하여 생활권을 정의합니다 (Exp08, Exp10).
 
-    행정구역(동) 경계를 넘어 실제 좌표 기반의 '생활권' 클러스터를 생성합니다.
-    이 클러스터는 이후 Fold 내 Target Encoding의 대상 컬럼으로 활용되어
-    coord_cluster_mean_price (생활권 평균 가격) 피처를 생성합니다.
+    지원 방법:
+        - kmeans: K-Means (기본, K 지정 필요)
+        - dbscan: DBSCAN (노이즈=-1, K 지정 불필요)
+        - hdbscan: HDBSCAN (노이즈=-1, 계층적)
 
     생성 피처:
-        - coord_cluster: K-Means 클러스터 ID (int)
+        - coord_cluster: 클러스터 ID (int, -1=노이즈)
 
     설정:
-        config.spatial_n_clusters: K-Means 클러스터 수 (기본값: 150)
+        config.spatial_clustering_method: "kmeans" | "dbscan" | "hdbscan"
+        config.spatial_n_clusters: K-Means용 K (기본: 150)
+        config.dbscan_eps, dbscan_min_samples: DBSCAN용
+        config.hdbscan_min_cluster_size: HDBSCAN용
 
     데이터 누수 방지:
-        - 학습 데이터에서 StandardScaler + KMeans를 fit
-        - 테스트 데이터에는 학습 기준 scaler/kmeans를 transform/predict
+        - 학습 데이터에서 fit → 테스트에는 transform/predict
     """
 
     @property
@@ -969,61 +1017,104 @@ class SpatialClusteringStep(PreprocessingStep):
         return "Step 6.8: 공간 클러스터링"
 
     def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
-        from sklearn.cluster import KMeans
+        from sklearn.cluster import DBSCAN, KMeans
         from sklearn.preprocessing import StandardScaler
 
-        n_clusters = ctx.config.spatial_n_clusters
+        cfg = ctx.config
+        method = getattr(cfg, "spatial_clustering_method", "kmeans") or "kmeans"
 
         if "좌표X" not in ctx.X_train.columns or "좌표Y" not in ctx.X_train.columns:
             print("  좌표 컬럼 없음 — 건너뜀")
             return ctx
 
-        # ── 학습 데이터: fit + predict ──
+        # ── 학습 데이터 준비 ──
         coords_train = ctx.X_train[["좌표X", "좌표Y"]].values.astype("float64")
-
         train_nan_mask = np.isnan(coords_train).any(axis=1)
         if train_nan_mask.any():
             print(f"  [WARN] 학습 데이터 좌표 NaN: {train_nan_mask.sum():,}건 → 전체 평균으로 대체")
             col_means = np.nanmean(coords_train, axis=0)
+            coords_train = coords_train.copy()
             coords_train[train_nan_mask] = col_means
 
         scaler = StandardScaler()
         coords_train_scaled = scaler.fit_transform(coords_train)
 
-        kmeans = KMeans(
-            n_clusters=n_clusters,
-            random_state=42,
-            n_init=10,
-            max_iter=300,
-        )
-        ctx.X_train["coord_cluster"] = kmeans.fit_predict(coords_train_scaled)
+        # ── 클러스터링 (학습 데이터) ──
+        if method == "kmeans":
+            n_clusters = cfg.spatial_n_clusters
+            clusterer = KMeans(
+                n_clusters=n_clusters,
+                random_state=42,
+                n_init=10,
+                max_iter=300,
+            )
+            ctx.X_train["coord_cluster"] = clusterer.fit_predict(coords_train_scaled)
+            ctx.train_stats["spatial_clusterer"] = clusterer
+        elif method == "dbscan":
+            eps = getattr(cfg, "dbscan_eps", 0.05)
+            min_samples = getattr(cfg, "dbscan_min_samples", 5)
+            clusterer = DBSCAN(eps=eps, min_samples=min_samples)
+            ctx.X_train["coord_cluster"] = clusterer.fit_predict(coords_train_scaled)
+            ctx.train_stats["spatial_clusterer"] = clusterer
+        elif method == "hdbscan":
+            try:
+                import hdbscan
+            except ImportError:
+                print("  [WARN] hdbscan 미설치 — K-Means로 대체")
+                method = "kmeans"
+                clusterer = KMeans(n_clusters=cfg.spatial_n_clusters, random_state=42, n_init=10, max_iter=300)
+                ctx.X_train["coord_cluster"] = clusterer.fit_predict(coords_train_scaled)
+                ctx.train_stats["spatial_clusterer"] = clusterer
+            else:
+                min_cluster_size = getattr(cfg, "hdbscan_min_cluster_size", 10)
+                min_samples = getattr(cfg, "hdbscan_min_samples", None)
+                clusterer = hdbscan.HDBSCAN(
+                    min_cluster_size=min_cluster_size,
+                    min_samples=min_samples,
+                    cluster_selection_method="eom",
+                )
+                ctx.X_train["coord_cluster"] = clusterer.fit_predict(coords_train_scaled)
+                ctx.train_stats["spatial_clusterer"] = clusterer
+        else:
+            print(f"  [WARN] 알 수 없는 방법 '{method}' — K-Means 사용")
+            clusterer = KMeans(n_clusters=cfg.spatial_n_clusters, random_state=42, n_init=10, max_iter=300)
+            ctx.X_train["coord_cluster"] = clusterer.fit_predict(coords_train_scaled)
+            ctx.train_stats["spatial_clusterer"] = clusterer
+
+        ctx.train_stats["spatial_scaler"] = scaler
+        ctx.train_stats["spatial_method"] = method
 
         # ── 테스트 데이터: transform + predict ──
         coords_test = ctx.X_test[["좌표X", "좌표Y"]].values.astype("float64")
-
         test_nan_mask = np.isnan(coords_test).any(axis=1)
         if test_nan_mask.any():
-            print(f"  [WARN] 테스트 데이터 좌표 NaN: {test_nan_mask.sum():,}건 → 학습 평균으로 대체")
             col_means_test = np.nanmean(coords_test, axis=0)
+            coords_test = coords_test.copy()
             coords_test[test_nan_mask] = col_means_test
 
         coords_test_scaled = scaler.transform(coords_test)
-        ctx.X_test["coord_cluster"] = kmeans.predict(coords_test_scaled)
 
-        # ── 통계 저장 (재현성) ──
-        ctx.train_stats["spatial_scaler"] = scaler
-        ctx.train_stats["spatial_kmeans"] = kmeans
+        clusterer = ctx.train_stats["spatial_clusterer"]
+        if hasattr(clusterer, "predict"):
+            ctx.X_test["coord_cluster"] = clusterer.predict(coords_test_scaled)
+        else:
+            # DBSCAN/HDBSCAN은 predict 없음 → ApproximatePredictor 또는 최근접 클러스터
+            from sklearn.neighbors import NearestNeighbors
+            train_labels = ctx.X_train["coord_cluster"].values
+            nn = NearestNeighbors(n_neighbors=1).fit(coords_train_scaled)
+            _, indices = nn.kneighbors(coords_test_scaled)
+            ctx.X_test["coord_cluster"] = train_labels[indices.flatten()]
 
         # ── 결과 출력 ──
+        n_clusters_actual = ctx.X_train["coord_cluster"].nunique()
         cluster_counts = ctx.X_train["coord_cluster"].value_counts()
-        print(f"  K-Means 클러스터링 완료 (K={n_clusters})")
-        print(f"  학습: {len(ctx.X_train):,}건 → {n_clusters}개 클러스터")
-        print(f"  테스트: {len(ctx.X_test):,}건 → {ctx.X_test['coord_cluster'].nunique()}개 클러스터 사용")
-        print(
-            f"  클러스터 크기: min={cluster_counts.min():,}, "
-            f"max={cluster_counts.max():,}, "
-            f"mean={cluster_counts.mean():.0f}"
-        )
+        n_noise = (ctx.X_train["coord_cluster"] == -1).sum() if -1 in ctx.X_train["coord_cluster"].values else 0
+        print(f"  {method.upper()} 클러스터링 완료")
+        print(f"  학습: {len(ctx.X_train):,}건 → {n_clusters_actual}개 클러스터" + (f" (노이즈 {n_noise:,}건)" if n_noise else ""))
+        print(f"  테스트: {len(ctx.X_test):,}건")
+        valid_counts = cluster_counts[cluster_counts.index >= 0] if -1 in cluster_counts.index else cluster_counts
+        if len(valid_counts) > 0:
+            print(f"  클러스터 크기: min={valid_counts.min():,}, max={valid_counts.max():,}, mean={valid_counts.mean():.0f}")
         print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
         return ctx
 
@@ -1393,6 +1484,78 @@ class InteractionFeaturesStep(PreprocessingStep):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 7.75: 시계열 피처 (Exp10)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class TimeSeriesFeaturesStep(PreprocessingStep):
+    """동별/구별 과거 누적 거래 건수 등 시계열 피처를 생성합니다 (Exp10).
+
+    데이터 누수 방지: 계약년월 정렬 기준 과거 데이터만 사용.
+    - ts_dong_txn_count: 동별 해당 월 이전 누적 거래 건수
+    - ts_dong_rolling_mean: 동별 이전 3개월 평균 거래 건수 (선택)
+
+    설정:
+        config.use_timeseries_features: True면 활성화
+        config.timeseries_group_col: "동" | "구" | "시군구"
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 7.75: 시계열 피처"
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        cfg = ctx.config
+        if not getattr(cfg, "use_timeseries_features", True):
+            print("  시계열 피처 비활성화 — 건너뜀")
+            return ctx
+
+        group_col = getattr(cfg, "timeseries_group_col", "동")
+        for col in [group_col, "계약년월"]:
+            if col not in ctx.X_train.columns:
+                print(f"  '{col}' 컬럼 없음 — 시계열 피처 건너뜀")
+                return ctx
+
+        # 학습: (group_col, 계약년월)별로 정렬 후 누적 건수
+        train = ctx.X_train.copy()
+        train["_ts_ym"] = pd.to_numeric(train["계약년월"], errors="coerce").fillna(0).astype(int)
+        train["_ts_grp"] = train[group_col].astype(str)
+
+        # 동별·월별 누적 건수: 해당 월 이전의 건수만 카운트
+        cumcount_map: dict[tuple[str, int], int] = {}
+        for (grp, ym), sub in train.groupby(["_ts_grp", "_ts_ym"]):
+            prev_count = train[(train["_ts_grp"] == grp) & (train["_ts_ym"] < ym)].shape[0]
+            cumcount_map[(grp, ym)] = prev_count
+
+        train["ts_dong_txn_count"] = train.apply(
+            lambda r: cumcount_map.get((str(r["_ts_grp"]), int(r["_ts_ym"])), 0),
+            axis=1,
+        )
+        train = train.drop(columns=["_ts_ym", "_ts_grp"])
+        ctx.X_train = train
+
+        # 테스트: 학습 데이터 기준으로 동별·월별 누적 건수 매핑
+        test = ctx.X_test.copy()
+        test["_ts_ym"] = pd.to_numeric(test["계약년월"], errors="coerce").fillna(0).astype(int)
+        test["_ts_grp"] = test[group_col].astype(str)
+
+        train_df = ctx.X_train[["계약년월", group_col]].copy()
+        train_df["_ts_ym"] = pd.to_numeric(train_df["계약년월"], errors="coerce").fillna(0).astype(int)
+        train_df["_ts_grp"] = train_df[group_col].astype(str)
+
+        def _test_count(row: pd.Series) -> int:
+            grp, ym = str(row["_ts_grp"]), int(row["_ts_ym"])
+            return int(((train_df["_ts_grp"] == grp) & (train_df["_ts_ym"] < ym)).sum())
+
+        test["ts_dong_txn_count"] = test.apply(_test_count, axis=1)
+        test = test.drop(columns=["_ts_ym", "_ts_grp"])
+        ctx.X_test = test
+
+        print(f"  ts_dong_txn_count: 동별 과거 누적 거래 건수 (group={group_col})")
+        print(f"  범위: train [{ctx.X_train['ts_dong_txn_count'].min():,} ~ {ctx.X_train['ts_dong_txn_count'].max():,}]")
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Step 7.8: Bayesian Smoothed Target Encoding
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class TargetEncodingStep(PreprocessingStep):
@@ -1648,6 +1811,125 @@ class TargetLogTransformStep(PreprocessingStep):
         y_restored = self.inverse_transform(ctx.y_train_log.values)
         max_error = np.max(np.abs(ctx.y_train.values - y_restored))
         print(f"  역변환 최대 오차: {max_error:.10f}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 8.3: Adversarial Validation 기반 피처 제거 (Exp10)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class AdversarialValidationStep(PreprocessingStep):
+    """Train/Test 구분력이 높은 피처를 제거합니다 (Exp10).
+
+    Train=1, Test=0 레이블로 분류기 학습 → 중요도 높은 피처 = 분포 차이 큼.
+    해당 피처 제거로 테스트 일반화 향상 (단, 유용한 피처까지 제거될 수 있음).
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 8.3: Adversarial Validation 기반 피처 제거"
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        cfg = ctx.config
+        if not getattr(cfg, "use_adversarial_validation", False):
+            print("  Adversarial Validation 비활성화 — 건너뜀")
+            return ctx
+
+        top_n = getattr(cfg, "adversarial_top_n_remove", 5)
+        num_cols = ctx.X_train.select_dtypes(include=[np.number]).columns.tolist()
+        if len(num_cols) < 2:
+            print("  수치형 피처 부족 — 건너뜀")
+            return ctx
+
+        X_train = ctx.X_train[num_cols].fillna(0)
+        X_test = ctx.X_test[num_cols].fillna(0)
+        X_combined = pd.concat([X_train, X_test], ignore_index=True)
+        y_source = np.array([1] * len(X_train) + [0] * len(X_test))
+
+        try:
+            import lightgbm as lgb
+        except ImportError:
+            print("  [WARN] LightGBM 없음 — 건너뜀")
+            return ctx
+
+        clf = lgb.LGBMClassifier(n_estimators=100, random_state=42, verbose=-1)
+        clf.fit(X_combined, y_source)
+        imp = pd.Series(clf.feature_importances_, index=num_cols).sort_values(ascending=False)
+        to_remove = imp.head(top_n).index.tolist()
+
+        ctx.X_train = ctx.X_train.drop(columns=to_remove, errors="ignore")
+        ctx.X_test = ctx.X_test.drop(columns=to_remove, errors="ignore")
+        ctx.categorical_cols = [c for c in ctx.categorical_cols if c not in to_remove]
+        print(f"  제거된 피처 ({len(to_remove)}개): {to_remove}")
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 8.4: Feature Selection (Permutation/SHAP) (Exp10)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class FeatureSelectionStep(PreprocessingStep):
+    """Permutation Importance 또는 SHAP 기반 피처 선택 (Exp10).
+
+    상위 K개 피처만 유지하여 노이즈 감소 및 과적합 방지.
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 8.4: Feature Selection"
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        cfg = ctx.config
+        if not getattr(cfg, "use_feature_selection", False):
+            print("  Feature Selection 비활성화 — 건너뜀")
+            return ctx
+
+        top_k = getattr(cfg, "feature_selection_top_k", 40)
+        method = getattr(cfg, "feature_selection_method", "permutation") or "permutation"
+
+        num_cols = ctx.X_train.select_dtypes(include=[np.number]).columns.tolist()
+        if len(num_cols) <= top_k:
+            print(f"  피처 수({len(num_cols)}) <= top_k({top_k}) — 건너뜀")
+            return ctx
+
+        X = ctx.X_train[num_cols].fillna(0)
+        y = np.log1p(ctx.y_train.values)  # 모델이 log 타겟 사용
+
+        if method == "shap":
+            try:
+                import shap
+                import lightgbm as lgb
+            except ImportError:
+                print("  [WARN] SHAP/LightGBM 없음 — permutation으로 대체")
+                method = "permutation"
+
+        if method == "permutation":
+            from sklearn.ensemble import RandomForestRegressor
+            from sklearn.inspection import permutation_importance
+
+            model = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
+            model.fit(X, y)
+            perm = permutation_importance(model, X, y, n_repeats=3, random_state=42, n_jobs=-1)
+            imp = pd.Series(perm.importances_mean, index=num_cols).sort_values(ascending=False)
+        elif method == "shap":
+            import lightgbm as lgb
+            import shap
+            model = lgb.LGBMRegressor(n_estimators=100, random_state=42, verbose=-1)
+            model.fit(X, y)
+            explainer = shap.TreeExplainer(model)
+            shap_vals = explainer.shap_values(X)
+            imp = pd.Series(np.abs(shap_vals).mean(axis=0), index=num_cols).sort_values(ascending=False)
+        else:
+            print(f"  알 수 없는 방법 '{method}' — 건너뜀")
+            return ctx
+
+        keep = imp.head(top_k).index.tolist()
+        to_remove = [c for c in num_cols if c not in keep]
+        ctx.X_train = ctx.X_train.drop(columns=to_remove, errors="ignore")
+        ctx.X_test = ctx.X_test.drop(columns=to_remove, errors="ignore")
+        ctx.categorical_cols = [c for c in ctx.categorical_cols if c not in to_remove]
+        ctx.train_stats["feature_selection_kept"] = keep
+        print(f"  {method} 상위 {top_k}개 유지, {len(to_remove)}개 제거")
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
         return ctx
 
 

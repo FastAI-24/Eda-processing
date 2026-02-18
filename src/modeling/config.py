@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from dataclasses import dataclass, field
@@ -146,6 +147,22 @@ class ModelConfig:
     ensemble_models: list[str] = field(
         default_factory=lambda: ["lightgbm", "xgboost", "catboost"]
     )
+    # 앙상블 전략: "weighted"(가중 평균) | "stacking"(2단계 메타 학습)
+    ensemble_strategy: str = "weighted"
+    # Multi-seed 앙상블: 같은 모델 다른 시드로 안정성 향상 (Exp10)
+    ensemble_use_multi_seed: bool = False
+    ensemble_seeds: list[int] = field(
+        default_factory=lambda: [42, 43, 44, 45, 46]
+    )
+
+    # ── Pseudo Labeling (Exp10) ──
+    use_pseudo_labeling: bool = False
+    pseudo_label_ratio: float = 0.1  # 상위 신뢰도 비율만 pseudo로 추가
+    pseudo_label_rounds: int = 1    # 반복 라운드 (1=1회만)
+
+    # ── Quantile Regression (Exp10) ──
+    use_quantile_regression: bool = False
+    quantile_alpha: float = 0.5  # 0.5=중앙값
 
     # ── 튜닝 파라미터 자동 적용 ──
 
@@ -208,3 +225,12 @@ class ModelConfig:
 
         print("적용할 튜닝 파라미터 없음")
         return False
+
+    def with_seed(self, seed: int) -> "ModelConfig":
+        """Multi-seed 앙상블용: 동일 설정에 시드만 변경한 복사본을 반환합니다."""
+        cfg = copy.deepcopy(self)
+        cfg.random_state = seed
+        cfg.lgbm_params = {**cfg.lgbm_params, "random_state": seed}
+        cfg.xgb_params = {**cfg.xgb_params, "random_state": seed}
+        cfg.catboost_params = {**cfg.catboost_params, "random_seed": seed}
+        return cfg

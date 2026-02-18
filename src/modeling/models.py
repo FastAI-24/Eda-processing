@@ -477,3 +477,95 @@ class CatBoostModel(BaseModel):
             "feature": self._feature_names,
             "importance": importance,
         }).sort_values("importance", ascending=False).reset_index(drop=True)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# LightGBM Quantile Regression — Exp10
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class LightGBMQuantileModel(LightGBMModel):
+    """LightGBM Quantile Regression (Exp10). alpha=0.5 → 중앙값 예측."""
+
+    def __init__(self, config: ModelConfig | None = None) -> None:
+        super().__init__(config)
+        alpha = getattr(self._config, "quantile_alpha", 0.5)
+        self._params = dict(self._config.lgbm_params)
+        self._params["objective"] = "quantile"
+        self._params["alpha"] = alpha
+        self._params["metric"] = "quantile"
+
+    @property
+    def name(self) -> str:
+        return "LightGBM_Quantile"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MLP (Neural Network) — Exp10
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class MLPModel(BaseModel):
+    """sklearn MLPRegressor 기반 신경망 모델 (Exp10).
+
+    GBDT와 이질적인 패턴 학습으로 앙상블 다양성 확보.
+    수치형 피처만 사용 (범주형은 미지원).
+    """
+
+    def __init__(self, config: ModelConfig | None = None) -> None:
+        self._config = config or ModelConfig()
+        self._model: Any = None
+        self._feature_names: list[str] = []
+        self._scaler: Any = None
+
+    @property
+    def name(self) -> str:
+        return "MLP"
+
+    def train(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series | np.ndarray,
+        X_val: pd.DataFrame | None = None,
+        y_val: pd.Series | np.ndarray | None = None,
+        categorical_features: list[str] | None = None,
+        sample_weight: np.ndarray | None = None,
+    ) -> Any:
+        from sklearn.neural_network import MLPRegressor
+        from sklearn.preprocessing import StandardScaler
+
+        num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
+        X = X_train[num_cols].fillna(0)
+        self._feature_names = num_cols
+        y = np.asarray(y_train, dtype=np.float64)
+
+        self._scaler = StandardScaler()
+        X_scaled = self._scaler.fit_transform(X)
+
+        self._model = MLPRegressor(
+            hidden_layer_sizes=(256, 128, 64),
+            activation="relu",
+            solver="adam",
+            alpha=0.001,
+            max_iter=500,
+            early_stopping=True,
+            validation_fraction=0.1,
+            random_state=self._config.random_state,
+        )
+        self._model.fit(X_scaled, y)
+        return self._model
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        if self._model is None:
+            raise RuntimeError("모델이 학습되지 않았습니다.")
+        num_cols = [c for c in self._feature_names if c in X.columns]
+        X_num = X[num_cols].fillna(0).reindex(columns=self._feature_names).fillna(0)
+        X_scaled = self._scaler.transform(X_num)
+        return self._model.predict(X_scaled)
+
+    def get_feature_importance(self) -> pd.DataFrame | None:
+        if self._model is None or not hasattr(self._model, "coefs_"):
+            return None
+        coef = self._model.coefs_[0]
+        imp = np.abs(coef).sum(axis=1)
+        n = min(len(imp), len(self._feature_names))
+        return pd.DataFrame({
+            "feature": self._feature_names[:n],
+            "importance": imp[:n],
+        }).sort_values("importance", ascending=False).reset_index(drop=True)

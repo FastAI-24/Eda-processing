@@ -31,10 +31,13 @@ import numpy as np
 from .base import PreprocessingContext, PreprocessingStep
 from .config import PreprocessingConfig
 from .steps import (
+    AdversarialValidationStep,
     CoordinateInterpolationStep,
     DateAddressFeaturesStep,
+    FeatureSelectionStep,
     FilterCancelledTransactionsStep,
     FloatToIntConversionStep,
+    HanRiverDistanceStep,
     IdentifyCategoricalColumnsStep,
     InteractionFeaturesStep,
     LowImportanceFeatureRemovalStep,
@@ -52,6 +55,7 @@ from .steps import (
     TargetLogTransformStep,
     TargetSeparationStep,
     TemporalFeaturesStep,
+    TimeSeriesFeaturesStep,
     TransitFeaturesStep,
 )
 
@@ -212,12 +216,16 @@ class PreprocessingPipeline:
         pipeline.add_step(CoordinateInterpolationStep())
         pipeline.add_step(SpatialFeaturesStep())
         pipeline.add_step(TransitFeaturesStep())
+        pipeline.add_step(HanRiverDistanceStep())              # Exp10: 한강 거리
         pipeline.add_step(SpatialClusteringStep())             # Exp08: 좌표 클러스터링
         pipeline.add_step(MissingValueImputerStep())
         pipeline.add_step(ParkingPerHouseholdStep())
         pipeline.add_step(QualityFeaturesStep())               # Exp07: 단지 품질 피처
         pipeline.add_step(InteractionFeaturesStep())           # 교호작용 + 도메인 피처
+        pipeline.add_step(TimeSeriesFeaturesStep())           # Exp10: 시계열 피처
         pipeline.add_step(OutlierClippingStep())               # 학습/테스트 동일 범위 클리핑
+        pipeline.add_step(AdversarialValidationStep())         # Exp10: AV 기반 피처 제거
+        pipeline.add_step(FeatureSelectionStep())             # Exp10: Permutation/SHAP 피처 선택
         pipeline.add_step(LowImportanceFeatureRemovalStep())   # + Feature Diet (Exp07)
         pipeline.add_step(TargetLogTransformStep())
         return pipeline

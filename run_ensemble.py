@@ -98,6 +98,11 @@ def main(
     n_splits: int = 5,
     save_submission: bool = False,
     models: list[str] | None = None,
+    use_stacking: bool = False,
+    use_multi_seed: bool = False,
+    use_pseudo_labeling: bool = False,
+    use_quantile: bool = False,
+    use_mlp: bool = False,
 ) -> None:
     """앙상블 학습 파이프라인을 실행합니다."""
     total_start = time.time()
@@ -105,6 +110,22 @@ def main(
     config = ModelConfig(n_splits=n_splits)
     if models:
         config.ensemble_models = models
+    else:
+        base = ["lightgbm", "xgboost", "catboost"]
+        if use_quantile:
+            base.append("lightgbm_quantile")
+        if use_mlp:
+            base.append("mlp")
+        config.ensemble_models = base
+    if use_stacking:
+        config.ensemble_strategy = "stacking"
+    if use_multi_seed:
+        config.ensemble_use_multi_seed = True
+    if use_pseudo_labeling:
+        config.use_pseudo_labeling = True
+
+    # 개별 모델 성능 향상: Optuna 튜닝 결과 자동 적용
+    config.apply_tuned_params()
 
     print(f"\n{'━'*60}")
     print(f"  🚀 House Price Prediction — 앙상블 학습 파이프라인")
@@ -116,6 +137,23 @@ def main(
     # ── 앙상블 학습 ──
     ensemble_trainer = EnsembleTrainer(config)
     ensemble_result = ensemble_trainer.train_ensemble(X_train, y_train, X_test)
+
+    # ── Pseudo Labeling (Exp10) ──
+    if config.use_pseudo_labeling and ensemble_result["ensemble_test_predictions"] is not None:
+        ratio = config.pseudo_label_ratio
+        n_pseudo = max(1, int(len(X_test) * ratio))
+        pred_log = ensemble_result["ensemble_test_predictions"]
+        median = np.median(pred_log)
+        dist = np.abs(pred_log - median)
+        idx = np.argsort(dist)[:n_pseudo]
+        X_pseudo = X_test.iloc[idx].reset_index(drop=True)
+        # 모델은 log1p(y) 학습 → pseudo도 원본 스케일로 변환 (만원)
+        y_pseudo_original = np.expm1(pred_log[idx])
+        y_pseudo = pd.Series(y_pseudo_original, index=X_pseudo.index)
+        X_train_aug = pd.concat([X_train, X_pseudo], ignore_index=True)
+        y_train_aug = pd.concat([y_train, y_pseudo], ignore_index=True)
+        print(f"\n  📌 Pseudo Labeling: {n_pseudo}건 추가 후 재학습")
+        ensemble_result = ensemble_trainer.train_ensemble(X_train_aug, y_train_aug, X_test)
 
     # ── 개별 모델 피처 중요도 저장 ──
     for model_name, result in ensemble_result["results"].items():
@@ -145,8 +183,42 @@ if __name__ == "__main__":
         "--models",
         nargs="+",
         default=None,
-        choices=["lightgbm", "xgboost", "catboost"],
-        help="사용할 모델 (기본: 전체)",
+        choices=["lightgbm", "lightgbm_quantile", "xgboost", "catboost", "mlp"],
+        help="사용할 모델 (기본: lightgbm, xgboost, catboost)",
+    )
+    parser.add_argument(
+        "--stacking",
+        action="store_true",
+        help="Stacking 앙상블 사용 (Ridge 메타 학습기)",
+    )
+    parser.add_argument(
+        "--multi-seed",
+        action="store_true",
+        help="Multi-seed 앙상블 사용 (5개 시드 평균)",
+    )
+    parser.add_argument(
+        "--pseudo-labeling",
+        action="store_true",
+        help="Pseudo Labeling 사용 (테스트 데이터 반복 학습)",
+    )
+    parser.add_argument(
+        "--quantile",
+        action="store_true",
+        help="LightGBM Quantile Regression 모델 추가",
+    )
+    parser.add_argument(
+        "--mlp",
+        action="store_true",
+        help="MLP 신경망 모델 추가",
     )
     args = parser.parse_args()
-    main(n_splits=args.n_splits, save_submission=args.save_submission, models=args.models)
+    main(
+        n_splits=args.n_splits,
+        save_submission=args.save_submission,
+        models=args.models,
+        use_stacking=args.stacking,
+        use_multi_seed=args.multi_seed,
+        use_pseudo_labeling=args.pseudo_labeling,
+        use_quantile=args.quantile,
+        use_mlp=args.mlp,
+    )

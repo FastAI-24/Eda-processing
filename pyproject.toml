@@ -16,6 +16,7 @@ dependencies = [
     "xgboost>=2.0.0",
     "catboost>=1.2.0",
     "optuna>=3.0.0",
+    "hdbscan>=0.8.0",
 ]
 
 [project.scripts]
