@@ -69,15 +69,22 @@ def _save_submission(
     predictions: np.ndarray,
     output_dir: Path,
     use_log_target: bool,
+    y_train: np.ndarray | None = None,
 ) -> None:
-    """submission.csv를 저장합니다."""
+    """submission.csv를 저장합니다 (성능 최적화 Phase 4: 예측값 클리핑)."""
     if use_log_target:
         predictions_original = np.expm1(predictions)
     else:
-        predictions_original = predictions
+        predictions_original = predictions.copy()
 
-    # 음수 클리핑 + 정수형 반올림
+    # 음수 클리핑
     predictions_original = np.maximum(predictions_original, 0)
+    # 학습 target 범위 기반 클리핑 (극단값 보정)
+    if y_train is not None and len(y_train) > 0:
+        y_min, y_max = float(y_train.min()), float(y_train.max())
+        clip_lo = max(0, y_min * 0.5)
+        clip_hi = y_max * 1.5
+        predictions_original = np.clip(predictions_original, clip_lo, clip_hi)
     predictions_int = np.round(predictions_original).astype(np.int64)
 
     # 평가 시스템이 pred[["ID", "target"]]로 접근하므로 ID 컬럼 포함
@@ -175,6 +182,7 @@ def main(
             ensemble_result["ensemble_test_predictions"],
             config.output_dir,
             config.use_log_target,
+            y_train=y_train.values if hasattr(y_train, "values") else y_train,
         )
 
     total_elapsed = time.time() - total_start

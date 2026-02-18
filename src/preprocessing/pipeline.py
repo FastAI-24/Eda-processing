@@ -178,7 +178,7 @@ class PreprocessingPipeline:
     ) -> "PreprocessingPipeline":
         """최적화된 기본 파이프라인을 생성합니다.
 
-        GAMMA_PROMPT.md 기준 15단계 핵심 파이프라인 + 실험 확장 단계:
+        docs/PREPROCESSING_PIPELINE.md 기준 21단계 파이프라인:
 
         [핵심 15단계]
             1.  취소 거래 제거 (FilterCancelledTransactions)
@@ -208,7 +208,7 @@ class PreprocessingPipeline:
             coord_cluster는 Fold 내 TE 대상으로 ModelConfig에 등록됩니다.
         """
         pipeline = cls(config=config)
-        # ── 핵심 파이프라인 (GAMMA_PROMPT.md 15단계 기반) ──
+        # ── 핵심 파이프라인 (21단계 기반) ──
         pipeline.add_step(FilterCancelledTransactionsStep())       # 1. 취소 거래 제거
         pipeline.add_step(TargetSeparationStep())                  # 4. 타겟 변수 분리 (X_train/X_test 생성)
         pipeline.add_step(RemoveHighMissingColumnsStep())          # 2. 불필요 컬럼 제거

@@ -85,7 +85,7 @@ class ModelConfig:
     time_lag_cols: list[str] = field(
         default_factory=lambda: ["아파트명", "동", "구"]
     )
-    time_lag_recent_months: int = 24  # 최근 N개월 기준
+    time_lag_recent_months: int = 12  # 최근 N개월 기준 (전략: 24→12, 최근 1년 집중)
 
     # ── LightGBM 하이퍼파라미터 ──
     lgbm_params: dict = field(default_factory=lambda: {
