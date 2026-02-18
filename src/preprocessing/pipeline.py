@@ -32,7 +32,9 @@ from .base import PreprocessingContext, PreprocessingStep
 from .config import PreprocessingConfig
 from .steps import (
     AdversarialValidationStep,
+    BrandFeatureStep,
     CoordinateInterpolationStep,
+    CoordinateOutlierDetectionStep,
     DateAddressFeaturesStep,
     FeatureSelectionStep,
     FilterCancelledTransactionsStep,
@@ -40,11 +42,14 @@ from .steps import (
     HanRiverDistanceStep,
     IdentifyCategoricalColumnsStep,
     InteractionFeaturesStep,
+    LabelEncodingStep,
     LowImportanceFeatureRemovalStep,
     MissingIndicatorStep,
     MissingValueImputerStep,
+    MulticollinearityRemovalStep,
     OutlierClippingStep,
     ParkingPerHouseholdStep,
+    ParkingPredictionStep,
     QualityFeaturesStep,
     RecentDataFilterStep,
     RemoveHighMissingColumnsStep,
@@ -173,59 +178,65 @@ class PreprocessingPipeline:
     ) -> "PreprocessingPipeline":
         """최적화된 기본 파이프라인을 생성합니다.
 
-        Pipeline:
-            Step 0   → 취소 거래 필터링
-            Step 1   → Target 분리
-            Step 2   → 고결측 컬럼 제거
-            Step 2.5 → Float→Int64 타입 변환
-            Step 3   → 컬럼명 정리 (LightGBM 호환)
-            Step 3.5 → 날짜/주소 파생 피처
-            Step 3.7 → 시간 파생 피처 (계약년/월/분기/반기 + cyclical)
-            Step 3.8 → 최신 데이터 필터링 (Exp06: 2017+ 데이터만 학습)
-            Step 4   → 범주형 컬럼 식별
-            Step 5   → 결측 지표 피처
-            Step 6   → 좌표 보간 (Kakao API + 시군구 평균)
-            Step 6.5 → 공간 파생 피처 (랜드마크 거리)
-            Step 6.7 → 버스/지하철 거리 피처 (BallTree)
-            Step 6.8 → 공간 클러스터링 (Exp08: K-Means 좌표 클러스터)
-            Step 7   → 결측값 대체 (Median Imputer)
-            Step 7.5 → 세대당 주차대수
-            Step 7.6 → 단지 품질 피처 (Exp07: unit_area_avg, 로그 변환)
-            Step 7.7 → 교호작용/도메인 피처
-                       (면적×층, 비율, 재건축 후보, 층구간, 면적대)
-            Step 8   → 이상치 클리핑 (학습 IQR → 테스트 동일 적용)
-            Step 8.5 → 저중요도 피처 + Feature Diet 제거 (Exp07)
-            Step 9   → Target 로그 변환
+        docs/PREPROCESSING_PIPELINE.md 기준 21단계 파이프라인:
+
+        [핵심 15단계]
+            1.  취소 거래 제거 (FilterCancelledTransactions)
+            2.  불필요 컬럼 제거 (RemoveHighMissingColumns)
+            3.  다중공선성 제거 (MulticollinearityRemoval)
+            4.  타겟 변수 분리 (TargetSeparation)
+            5.  이상치 탐지: 전용면적 — Step 8에서 통합 처리
+            6.  이상치 탐지: 좌표 (CoordinateOutlierDetection)
+            7~9. 지오코딩 (CoordinateInterpolation — 주소 압축+API+Spatial Median)
+            10. 결측치 모델링: 주차대수 (ParkingPrediction — RandomForest)
+            11. 파생변수 생성: 시간 (TemporalFeatures — days_since 포함)
+            12. 파생변수 생성: 브랜드 (BrandFeature — is_top_brand)
+            13. 범주형 인코딩: High Cardinality — Fold 내 TE (trainer.py)
+            14. 범주형 인코딩: Low Cardinality (LabelEncoding)
+            15. 타겟 로그 변환 (TargetLogTransform)
+
+        [확장 단계]
+            + 공간 파생 피처 (Golden Triangle min_dist_to_job)
+            + 교통 거리 피처 (BallTree)
+            + K-Means 좌표 클러스터링
+            + 단지 품질 / 교호작용 / 도메인 피처
+            + 이상치 클리핑 + Feature Diet
 
         Note:
-            TargetEncodingStep은 CV 누수 방지를 위해 전처리에서 제외.
-            trainer.py에서 각 Fold 내부에서 TE를 수행합니다.
+            TargetEncodingStep(High Cardinality)은 CV 누수 방지를 위해
+            전처리에서 제외. trainer.py에서 각 Fold 내부에서 수행합니다.
             coord_cluster는 Fold 내 TE 대상으로 ModelConfig에 등록됩니다.
         """
         pipeline = cls(config=config)
-        pipeline.add_step(FilterCancelledTransactionsStep())
-        pipeline.add_step(TargetSeparationStep())
-        pipeline.add_step(RemoveHighMissingColumnsStep())
-        pipeline.add_step(FloatToIntConversionStep())
-        pipeline.add_step(SanitizeColumnNamesStep())
-        pipeline.add_step(DateAddressFeaturesStep())
-        pipeline.add_step(TemporalFeaturesStep())
-        pipeline.add_step(RecentDataFilterStep())              # Exp06: 2017+ 필터링
-        pipeline.add_step(IdentifyCategoricalColumnsStep())
-        pipeline.add_step(MissingIndicatorStep())
-        pipeline.add_step(CoordinateInterpolationStep())
-        pipeline.add_step(SpatialFeaturesStep())
-        pipeline.add_step(TransitFeaturesStep())
-        pipeline.add_step(HanRiverDistanceStep())              # Exp10: 한강 거리
-        pipeline.add_step(SpatialClusteringStep())             # Exp08: 좌표 클러스터링
-        pipeline.add_step(MissingValueImputerStep())
-        pipeline.add_step(ParkingPerHouseholdStep())
-        pipeline.add_step(QualityFeaturesStep())               # Exp07: 단지 품질 피처
-        pipeline.add_step(InteractionFeaturesStep())           # 교호작용 + 도메인 피처
-        pipeline.add_step(TimeSeriesFeaturesStep())           # Exp10: 시계열 피처
-        pipeline.add_step(OutlierClippingStep())               # 학습/테스트 동일 범위 클리핑
-        pipeline.add_step(AdversarialValidationStep())         # Exp10: AV 기반 피처 제거
-        pipeline.add_step(FeatureSelectionStep())             # Exp10: Permutation/SHAP 피처 선택
-        pipeline.add_step(LowImportanceFeatureRemovalStep())   # + Feature Diet (Exp07)
-        pipeline.add_step(TargetLogTransformStep())
+        # ── 핵심 파이프라인 (21단계 기반) ──
+        pipeline.add_step(FilterCancelledTransactionsStep())       # 1. 취소 거래 제거
+        pipeline.add_step(TargetSeparationStep())                  # 4. 타겟 변수 분리 (X_train/X_test 생성)
+        pipeline.add_step(RemoveHighMissingColumnsStep())          # 2. 불필요 컬럼 제거
+        pipeline.add_step(MulticollinearityRemovalStep())          # 3. 다중공선성 제거
+        pipeline.add_step(FloatToIntConversionStep())              #    타입 정리
+        pipeline.add_step(SanitizeColumnNamesStep())               #    컬럼명 정리 (LightGBM 호환)
+        pipeline.add_step(DateAddressFeaturesStep())               #    날짜/주소 파생 피처
+        pipeline.add_step(TemporalFeaturesStep())                  # 11. 시간 파생 (days_since 포함)
+        pipeline.add_step(RecentDataFilterStep())                  #    Exp06: 2017+ 필터링
+        pipeline.add_step(IdentifyCategoricalColumnsStep())        #    범주형 컬럼 식별
+        pipeline.add_step(MissingIndicatorStep())                  #    결측 지표 피처
+        pipeline.add_step(CoordinateOutlierDetectionStep())        # 6. 좌표 이상치 탐지 (서울 경계)
+        pipeline.add_step(CoordinateInterpolationStep())           # 7~9. 지오코딩 (API+보간)
+        pipeline.add_step(SpatialFeaturesStep())                   #    Golden Triangle + min_dist_to_job
+        pipeline.add_step(TransitFeaturesStep())                   #    교통 거리 피처 (BallTree)
+        pipeline.add_step(HanRiverDistanceStep())                  #    한강 거리
+        pipeline.add_step(SpatialClusteringStep())                 #    K-Means 좌표 클러스터링
+        pipeline.add_step(ParkingPredictionStep())                 # 10. 주차대수 RF 예측
+        pipeline.add_step(MissingValueImputerStep())               #    나머지 결측값 Median 대체
+        pipeline.add_step(ParkingPerHouseholdStep())               #    세대당 주차대수
+        pipeline.add_step(QualityFeaturesStep())                   #    단지 품질 피처
+        pipeline.add_step(BrandFeatureStep())                      # 12. is_top_brand
+        pipeline.add_step(InteractionFeaturesStep())               #    교호작용 + 도메인 피처
+        pipeline.add_step(TimeSeriesFeaturesStep())                #    시계열 피처
+        pipeline.add_step(OutlierClippingStep())                   # 5+8. 이상치 클리핑 (IQR)
+        pipeline.add_step(LabelEncodingStep())                     # 14. Low Cardinality Label Encoding
+        pipeline.add_step(AdversarialValidationStep())             #    AV 기반 피처 제거
+        pipeline.add_step(FeatureSelectionStep())                  #    Permutation/SHAP 피처 선택
+        pipeline.add_step(LowImportanceFeatureRemovalStep())       #    Feature Diet (Exp07)
+        pipeline.add_step(TargetLogTransformStep())                # 15. 타겟 로그 변환
         return pipeline

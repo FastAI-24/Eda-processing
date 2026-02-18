@@ -69,15 +69,22 @@ def _save_submission(
     predictions: np.ndarray,
     output_dir: Path,
     use_log_target: bool,
+    y_train: np.ndarray | None = None,
 ) -> None:
-    """submission.csv를 저장합니다."""
+    """submission.csv를 저장합니다 (성능 최적화 Phase 4: 예측값 클리핑)."""
     if use_log_target:
         predictions_original = np.expm1(predictions)
     else:
-        predictions_original = predictions
+        predictions_original = predictions.copy()
 
-    # 음수 클리핑 + 정수형 반올림
+    # 음수 클리핑
     predictions_original = np.maximum(predictions_original, 0)
+    # 학습 target 범위 기반 클리핑 (극단값 보정)
+    if y_train is not None and len(y_train) > 0:
+        y_min, y_max = float(y_train.min()), float(y_train.max())
+        clip_lo = max(0, y_min * 0.5)
+        clip_hi = y_max * 1.5
+        predictions_original = np.clip(predictions_original, clip_lo, clip_hi)
     predictions_int = np.round(predictions_original).astype(np.int64)
 
     # 평가 시스템이 pred[["ID", "target"]]로 접근하므로 ID 컬럼 포함
@@ -103,11 +110,15 @@ def main(
     use_pseudo_labeling: bool = False,
     use_quantile: bool = False,
     use_mlp: bool = False,
+    optimized: bool = False,
+    cv_strategy: str = "kfold",
+    no_tuned_params: bool = False,
 ) -> None:
     """앙상블 학습 파이프라인을 실행합니다."""
     total_start = time.time()
 
     config = ModelConfig(n_splits=n_splits)
+    config.cv_strategy = cv_strategy
     if models:
         config.ensemble_models = models
     else:
@@ -117,15 +128,18 @@ def main(
         if use_mlp:
             base.append("mlp")
         config.ensemble_models = base
-    if use_stacking:
+    if use_stacking or optimized:
         config.ensemble_strategy = "stacking"
-    if use_multi_seed:
+    if use_multi_seed or optimized:
         config.ensemble_use_multi_seed = True
+    if optimized:
+        config.use_fold_time_lag = True
     if use_pseudo_labeling:
         config.use_pseudo_labeling = True
 
-    # 개별 모델 성능 향상: Optuna 튜닝 결과 자동 적용
-    config.apply_tuned_params()
+    # 개별 모델 성능 향상: Optuna 튜닝 결과 자동 적용 (--no-tuned-params 시 건너뜀)
+    if not no_tuned_params:
+        config.apply_tuned_params()
 
     print(f"\n{'━'*60}")
     print(f"  🚀 House Price Prediction — 앙상블 학습 파이프라인")
@@ -168,6 +182,7 @@ def main(
             ensemble_result["ensemble_test_predictions"],
             config.output_dir,
             config.use_log_target,
+            y_train=y_train.values if hasattr(y_train, "values") else y_train,
         )
 
     total_elapsed = time.time() - total_start
@@ -211,6 +226,23 @@ if __name__ == "__main__":
         action="store_true",
         help="MLP 신경망 모델 추가",
     )
+    parser.add_argument(
+        "--optimized",
+        action="store_true",
+        help="최적화 모드: multi-seed + stacking + time-lag 한번에 활성화",
+    )
+    parser.add_argument(
+        "--cv-strategy",
+        type=str,
+        default="kfold",
+        choices=["kfold", "timeseries"],
+        help="CV 전략 (기본: kfold)",
+    )
+    parser.add_argument(
+        "--no-tuned-params",
+        action="store_true",
+        help="Optuna 튜닝 파라미터 미적용",
+    )
     args = parser.parse_args()
     main(
         n_splits=args.n_splits,
@@ -221,4 +253,7 @@ if __name__ == "__main__":
         use_pseudo_labeling=args.pseudo_labeling,
         use_quantile=args.quantile,
         use_mlp=args.mlp,
+        optimized=args.optimized,
+        cv_strategy=args.cv_strategy,
+        no_tuned_params=args.no_tuned_params,
     )

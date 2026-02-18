@@ -25,6 +25,8 @@ import time
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import Ridge
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error
 from tqdm import tqdm
 
 from .base import TrainingResult
@@ -215,12 +217,29 @@ class EnsembleTrainer:
         y: np.ndarray,
         has_test: bool,
     ) -> tuple[np.ndarray, np.ndarray | None, dict[str, float]]:
-        """Ridge 메타 학습기로 2단계 Stacking 앙상블."""
+        """Ridge 메타 학습기로 2단계 Stacking 앙상블 (alpha 그리드 탐색)."""
         oof_matrix = np.column_stack([
             r.oof_predictions for r in results.values()
             if r.oof_predictions is not None
         ])
-        meta = Ridge(alpha=1.0, random_state=42)
+        # alpha 그리드 탐색 (성능 최적화 전략 Phase 3)
+        alpha_candidates = [0.1, 1.0, 10.0, 100.0]
+        best_alpha = 1.0
+        best_rmse = float("inf")
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        for alpha in alpha_candidates:
+            fold_rmses = []
+            for tr_idx, val_idx in kf.split(oof_matrix):
+                meta = Ridge(alpha=alpha, random_state=42)
+                meta.fit(oof_matrix[tr_idx], y[tr_idx])
+                pred = meta.predict(oof_matrix[val_idx])
+                fold_rmses.append(np.sqrt(mean_squared_error(y[val_idx], pred)))
+            mean_rmse = np.mean(fold_rmses)
+            if mean_rmse < best_rmse:
+                best_rmse = mean_rmse
+                best_alpha = alpha
+        tqdm.write(f"  Ridge alpha 탐색: best={best_alpha} (CV RMSE={best_rmse:.6f})")
+        meta = Ridge(alpha=best_alpha, random_state=42)
         meta.fit(oof_matrix, y)
 
         oof_pred = meta.predict(oof_matrix)

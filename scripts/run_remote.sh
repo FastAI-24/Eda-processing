@@ -8,7 +8,10 @@
 #   ./scripts/run_remote.sh                    # 전처리 + 학습 (기본)
 #   ./scripts/run_remote.sh --preprocess-only  # 전처리만
 #   ./scripts/run_remote.sh --train-only       # 학습만 (전처리된 데이터 필요)
-#   ./scripts/run_remote.sh --ensemble         # 앙상블 학습
+#   ./scripts/run_remote.sh --ensemble         # 앙상블 학습 (SSH 연결 유지)
+#   ./scripts/run_remote.sh --ensemble-bg     # 앙상블 백그라운드 실행 (nohup, SSH 끊어도 유지)
+#   ./scripts/run_remote.sh --download-only   # 결과만 다운로드 (앙상블 완료 후)
+#   ./scripts/run_remote.sh --monitor         # 앙상블 로그 실시간 모니터링 (tail -f)
 #   ./scripts/run_remote.sh --tune             # Optuna 하이퍼파라미터 튜닝
 #   ./scripts/run_remote.sh --setup            # 환경 설치만
 # ─────────────────────────────────────────────────────────────
@@ -49,12 +52,15 @@ case "${1:-}" in
     --preprocess-only) MODE="preprocess" ;;
     --train-only)      MODE="train" ;;
     --ensemble)        MODE="ensemble" ;;
+    --ensemble-bg)      MODE="ensemble_bg" ;;
+    --download-only)   MODE="download" ;;
+    --monitor)         MODE="monitor" ;;
     --tune)            MODE="tune" ;;
     --setup)           MODE="setup" ;;
     "")                MODE="full" ;;
     *)
         log_error "알 수 없는 옵션: $1"
-        echo "사용법: $0 [--preprocess-only|--train-only|--ensemble|--tune|--setup]"
+        echo "사용법: $0 [--preprocess-only|--train-only|--ensemble|--ensemble-bg|--download-only|--monitor|--tune|--setup]"
         exit 1
         ;;
 esac
@@ -76,6 +82,32 @@ if [ "${MODE}" = "setup" ]; then
     log_info "원격 서버 환경 설치 중..."
     ${SSH_CMD} 'bash -s' < "${SCRIPT_DIR}/setup_remote_env.sh"
     log_info "환경 설치 완료!"
+    exit 0
+fi
+
+# ── Step 2.5: 모니터링 (--monitor) ──
+if [ "${MODE}" = "monitor" ]; then
+    log_info "앙상블 로그 실시간 모니터링 (Ctrl+C로 종료)"
+    ${SSH_CMD} "tail -f ${REMOTE_PROJECT}/outputs/ensemble.log"
+    exit 0
+fi
+
+# ── Step 2.6: 다운로드만 (--download-only) ──
+if [ "${MODE}" = "download" ]; then
+    log_info "결과 다운로드만 수행..."
+    LOCAL_OUTPUT="${PROJECT_ROOT}/outputs"
+    mkdir -p "${LOCAL_OUTPUT}"
+    for f in submission.csv feature_importance_lightgbm.csv feature_importance_xgboost.csv feature_importance_catboost.csv preprocess.log train.log ensemble.log ensemble.pid tuning.log; do
+        ${SCP_CMD} "${SSH_USER}@${SSH_HOST}:${REMOTE_PROJECT}/outputs/${f}" "${LOCAL_OUTPUT}/" 2>/dev/null || true
+    done
+    for f in X_train_preprocessed.csv X_test_preprocessed.csv y_train_preprocessed.csv; do
+        if ${SSH_CMD} "test -f ${REMOTE_PROJECT}/notebooks/data/${f}" 2>/dev/null; then
+            log_info "전처리 데이터 다운로드: ${f}"
+            ${SCP_CMD} "${SSH_USER}@${SSH_HOST}:${REMOTE_PROJECT}/notebooks/data/${f}" "${PROJECT_ROOT}/notebooks/data/" 2>/dev/null || true
+        fi
+    done
+    log_info "다운로드 완료!"
+    ls -lh "${LOCAL_OUTPUT}/"*.csv 2>/dev/null || echo "  CSV 파일 없음"
     exit 0
 fi
 
@@ -130,8 +162,25 @@ case "${MODE}" in
         ;;
     ensemble)
         REMOTE_CMD+="
-    echo '── 앙상블 실행 ──'
-    python -u run_ensemble.py --save-submission 2>&1 | tee outputs/ensemble.log
+    echo '── 앙상블 실행 (optimized) ──'
+    rm -f outputs/optuna_best_params.json
+    python -u run_ensemble.py --optimized --no-tuned-params --cv-strategy timeseries --save-submission 2>&1 | tee outputs/ensemble.log
+"
+        ;;
+    ensemble_bg)
+        REMOTE_CMD+="
+    echo '── 앙상블 백그라운드 실행 (nohup) ──'
+    rm -f outputs/optuna_best_params.json
+    nohup bash -c \"
+        source /opt/conda/etc/profile.d/conda.sh
+        conda activate ${CONDA_ENV}
+        cd ${REMOTE_PROJECT}
+        export PROJECT_ROOT=${REMOTE_PROJECT}
+        python -u run_ensemble.py --optimized --no-tuned-params --cv-strategy timeseries --save-submission
+    \" >> outputs/ensemble.log 2>&1 &
+    echo \$! > outputs/ensemble.pid
+    echo '앙상블 PID:' \$(cat outputs/ensemble.pid)
+    echo '백그라운드에서 실행 중. 완료 후 --download-only 로 결과를 받으세요.'
 "
         ;;
     tune)
@@ -155,14 +204,27 @@ ${SSH_CMD} "${REMOTE_CMD}"
 
 log_info "원격 실행 완료!"
 
+if [ "${MODE}" = "ensemble_bg" ]; then
+    log_info "앙상블이 백그라운드에서 실행 중입니다 (SSH 끊어도 유지됨)"
+    echo ""
+    echo "  모니터링: $0 --monitor"
+    echo "  완료 후:  $0 --download-only"
+    echo ""
+fi
+
 # ── Step 5: 결과 다운로드 ──
-log_info "결과 다운로드 중..."
+if [ "${MODE}" = "ensemble_bg" ]; then
+    log_info "앙상블 백그라운드 모드: PID·로그만 다운로드 (submission은 완료 후 --download-only)"
+    DOWNLOAD_FILES="ensemble.pid ensemble.log"
+else
+    log_info "결과 다운로드 중..."
+    DOWNLOAD_FILES="submission.csv feature_importance_lightgbm.csv feature_importance_xgboost.csv feature_importance_catboost.csv preprocess.log train.log ensemble.log tuning.log"
+fi
 
 LOCAL_OUTPUT="${PROJECT_ROOT}/outputs"
 mkdir -p "${LOCAL_OUTPUT}"
 
-# submission 및 로그 다운로드
-for f in submission.csv feature_importance_lightgbm.csv feature_importance_xgboost.csv feature_importance_catboost.csv preprocess.log train.log ensemble.log tuning.log; do
+for f in ${DOWNLOAD_FILES}; do
     ${SCP_CMD} "${SSH_USER}@${SSH_HOST}:${REMOTE_PROJECT}/outputs/${f}" "${LOCAL_OUTPUT}/" 2>/dev/null || true
 done
 
@@ -177,10 +239,19 @@ done
 log_info "결과 다운로드 완료!"
 
 echo ""
-echo "============================================"
-echo " 전체 작업 완료!"
-echo "============================================"
-echo ""
-echo "결과 파일:"
-ls -lh "${LOCAL_OUTPUT}/"*.csv 2>/dev/null || echo "  CSV 파일 없음"
-ls -lh "${LOCAL_OUTPUT}/"*.log 2>/dev/null || echo "  로그 파일 없음"
+if [ "${MODE}" = "ensemble_bg" ]; then
+    echo "============================================"
+    echo " 앙상블 백그라운드 시작됨"
+    echo "============================================"
+    echo ""
+    echo "모니터링: $0 --monitor"
+    echo "완료 후:  $0 --download-only"
+else
+    echo "============================================"
+    echo " 전체 작업 완료!"
+    echo "============================================"
+    echo ""
+    echo "결과 파일:"
+    ls -lh "${LOCAL_OUTPUT}/"*.csv 2>/dev/null || echo "  CSV 파일 없음"
+    ls -lh "${LOCAL_OUTPUT}/"*.log 2>/dev/null || echo "  로그 파일 없음"
+fi

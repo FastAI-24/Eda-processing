@@ -61,7 +61,7 @@ class HyperparameterTuner:
             "boosting_type": "gbdt",
             "n_estimators": 5000,
             "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.15, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 31, 512),
+            "num_leaves": trial.suggest_int("num_leaves", 31, 127),  # 512→127 과적합 방지
             "max_depth": trial.suggest_int("max_depth", -1, 12),
             "min_child_samples": trial.suggest_int("min_child_samples", 10, 200),
             "subsample": trial.suggest_float("subsample", 0.5, 1.0),
