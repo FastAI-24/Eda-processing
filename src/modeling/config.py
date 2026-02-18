@@ -120,7 +120,7 @@ class ModelConfig:
 
     # ── CatBoost 하이퍼파라미터 ──
     catboost_params: dict = field(default_factory=lambda: {
-        "iterations": 10000,
+        "iterations": 5000,
         "learning_rate": 0.05,
         "depth": 8,
         "l2_leaf_reg": 3.0,
