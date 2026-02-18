@@ -98,6 +98,8 @@ def main(
     n_splits: int = 5,
     save_submission: bool = False,
     models: list[str] | None = None,
+    use_stacking: bool = False,
+    use_multi_seed: bool = False,
 ) -> None:
     """앙상블 학습 파이프라인을 실행합니다."""
     total_start = time.time()
@@ -105,6 +107,10 @@ def main(
     config = ModelConfig(n_splits=n_splits)
     if models:
         config.ensemble_models = models
+    if use_stacking:
+        config.ensemble_strategy = "stacking"
+    if use_multi_seed:
+        config.ensemble_use_multi_seed = True
 
     print(f"\n{'━'*60}")
     print(f"  🚀 House Price Prediction — 앙상블 학습 파이프라인")
@@ -148,5 +154,21 @@ if __name__ == "__main__":
         choices=["lightgbm", "xgboost", "catboost"],
         help="사용할 모델 (기본: 전체)",
     )
+    parser.add_argument(
+        "--stacking",
+        action="store_true",
+        help="Stacking 앙상블 사용 (Ridge 메타 학습기)",
+    )
+    parser.add_argument(
+        "--multi-seed",
+        action="store_true",
+        help="Multi-seed 앙상블 사용 (5개 시드 평균)",
+    )
     args = parser.parse_args()
-    main(n_splits=args.n_splits, save_submission=args.save_submission, models=args.models)
+    main(
+        n_splits=args.n_splits,
+        save_submission=args.save_submission,
+        models=args.models,
+        use_stacking=args.stacking,
+        use_multi_seed=args.multi_seed,
+    )

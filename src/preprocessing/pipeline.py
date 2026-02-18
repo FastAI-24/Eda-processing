@@ -52,6 +52,7 @@ from .steps import (
     TargetLogTransformStep,
     TargetSeparationStep,
     TemporalFeaturesStep,
+    TimeSeriesFeaturesStep,
     TransitFeaturesStep,
 )
 
@@ -217,7 +218,8 @@ class PreprocessingPipeline:
         pipeline.add_step(ParkingPerHouseholdStep())
         pipeline.add_step(QualityFeaturesStep())               # Exp07: 단지 품질 피처
         pipeline.add_step(InteractionFeaturesStep())           # 교호작용 + 도메인 피처
-        pipeline.add_step(OutlierClippingStep())               # 학습/테스트 동일 범위 클리핑
+        pipeline.add_step(TimeSeriesFeaturesStep())           # Exp10: 시계열 피처
+        pipeline.add_step(OutlierClippingStep())              # 학습/테스트 동일 범위 클리핑
         pipeline.add_step(LowImportanceFeatureRemovalStep())   # + Feature Diet (Exp07)
         pipeline.add_step(TargetLogTransformStep())
         return pipeline

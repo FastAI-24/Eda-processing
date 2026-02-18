@@ -112,8 +112,16 @@ class PreprocessingConfig:
     # ── 최신 데이터 필터링 (Exp06) ──
     recent_data_year_from: int | None = 2017
 
-    # ── 공간 클러스터링 (Exp08) ──
+    # ── 공간 클러스터링 (Exp08, Exp10) ──
     spatial_n_clusters: int = 150
+    # "kmeans" | "dbscan" | "hdbscan" (Exp10: DBSCAN/HDBSCAN 대안)
+    spatial_clustering_method: str = "kmeans"
+    # DBSCAN 파라미터 (spatial_clustering_method="dbscan"일 때)
+    dbscan_eps: float = 0.05  # 표준화 좌표 기준
+    dbscan_min_samples: int = 5
+    # HDBSCAN 파라미터 (spatial_clustering_method="hdbscan"일 때)
+    hdbscan_min_cluster_size: int = 10
+    hdbscan_min_samples: int | None = None
 
     # ── 저중요도 피처 제거 ──
     low_importance_cols: list[str] = field(
@@ -124,6 +132,10 @@ class PreprocessingConfig:
             "세대전기계약방법", "k-관리방식", "k-복도유형",
         ]
     )
+
+    # ── 시계열 피처 (Exp10) ──
+    use_timeseries_features: bool = True
+    timeseries_group_col: str = "동"  # "동" | "구" | "시군구"
 
     # ── Feature Diet (Exp07) ──
     # 파생 피처로 대체된 원본 컬럼을 제거하여 과적합 방지
