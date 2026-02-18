@@ -130,8 +130,9 @@ case "${MODE}" in
         ;;
     ensemble)
         REMOTE_CMD+="
-    echo '── 앙상블 실행 ──'
-    python -u run_ensemble.py --save-submission 2>&1 | tee outputs/ensemble.log
+    echo '── 앙상블 실행 (optimized) ──'
+    rm -f outputs/optuna_best_params.json
+    python -u run_ensemble.py --optimized --no-tuned-params --save-submission 2>&1 | tee outputs/ensemble.log
 "
         ;;
     tune)

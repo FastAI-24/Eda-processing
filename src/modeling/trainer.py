@@ -158,6 +158,89 @@ def compute_fold_target_encoding(
 
 
 # ─────────────────────────────────────────────────────────────
+# Fold 내 시간-지연 피처 (아파트/동/구별 가격 추세)
+# ─────────────────────────────────────────────────────────────
+def compute_fold_time_lag_features(
+    X_train_fold: pd.DataFrame,
+    y_train_fold: np.ndarray,
+    X_val_fold: pd.DataFrame,
+    X_test: pd.DataFrame | None,
+    time_col: str = "계약년월",
+    lag_cols: list[str] | None = None,
+    recent_months: int = 24,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
+    """Fold 학습 데이터만 사용하여 시간 기반 가격 추세 피처를 생성합니다.
+
+    CV 누수 방지: fold 학습 데이터에서만 통계 계산 → val/test에 매핑.
+
+    생성 피처 (lag_cols별):
+        - {col}_tx_count: 해당 범주의 거래 건수
+        - {col}_recent_price: 최근 N개월 평균가 (log space)
+        - {col}_price_trend: 가격 추세 (recent/overall - 1)
+    """
+    if lag_cols is None:
+        lag_cols = ["아파트명", "동", "구"]
+
+    if time_col not in X_train_fold.columns:
+        return X_train_fold, X_val_fold, X_test.copy() if X_test is not None else None
+
+    X_train_fold = X_train_fold.copy()
+    X_val_fold = X_val_fold.copy()
+    X_test_out = X_test.copy() if X_test is not None else None
+
+    ym = pd.to_numeric(X_train_fold[time_col], errors="coerce").fillna(0).astype(int)
+    max_ym = int(ym.max()) if ym.max() > 0 else 202312
+    # YYYYMM → 총 개월수 → N개월 전 → YYYYMM
+    y_max, m_max = max_ym // 100, max_ym % 100
+    total_months = max(0, y_max * 12 + m_max - recent_months)
+    recent_cutoff = (total_months // 12) * 100 + (total_months % 12)
+
+    base_df = pd.DataFrame({
+        "target": y_train_fold,
+        "ym": ym.values,
+    })
+
+    created: list[str] = []
+
+    for col in lag_cols:
+        if col not in X_train_fold.columns:
+            continue
+        base_df["cat"] = X_train_fold[col].astype(str).values
+
+        # 거래 건수
+        tx_count = base_df.groupby("cat")["target"].count()
+        for df_out, df_src in [
+            (X_train_fold, X_train_fold),
+            (X_val_fold, X_val_fold),
+            (X_test_out, X_test) if X_test_out is not None else (None, None),
+        ]:
+            if df_out is not None and col in df_src.columns:
+                df_out[f"{col}_tx_count"] = df_src[col].astype(str).map(tx_count).fillna(0).astype("float64")
+        created.append(f"{col}_tx_count")
+
+        # 전체 평균가
+        full_mean = base_df.groupby("cat")["target"].mean()
+
+        # 최근 N개월 평균가
+        recent_mask = base_df["ym"] >= recent_cutoff
+        if recent_mask.sum() > 0:
+            recent_mean = base_df.loc[recent_mask].groupby("cat")["target"].mean()
+            trend = (recent_mean / full_mean).reindex(full_mean.index).fillna(0.0) - 1.0
+
+            for df_out, df_src in [
+                (X_train_fold, X_train_fold),
+                (X_val_fold, X_val_fold),
+                (X_test_out, X_test) if X_test_out is not None else (None, None),
+            ]:
+                if df_out is not None and col in df_src.columns:
+                    df_out[f"{col}_recent_price"] = df_src[col].astype(str).map(recent_mean).fillna(0)
+                    df_out[f"{col}_price_trend"] = df_src[col].astype(str).map(trend).fillna(0)
+            created.extend([f"{col}_recent_price", f"{col}_price_trend"])
+
+    return X_train_fold, X_val_fold, X_test_out
+
+
+# ─────────────────────────────────────────────────────────────
 # Sample Weight 유틸리티
 # ─────────────────────────────────────────────────────────────
 def compute_sample_weight(
@@ -316,6 +399,8 @@ class Trainer:
             info_parts.append(f"SW(decay={cfg.sample_weight_decay})")
         if cfg.use_fold_target_encoding:
             info_parts.append(f"TE({len(cfg.target_encode_cols)}cols)")
+        if getattr(cfg, "use_fold_time_lag", False) and cfg.time_lag_cols:
+            info_parts.append(f"TL({len(cfg.time_lag_cols)}cols)")
         print(f"\n  ⚙ {model_name} | {' | '.join(info_parts)}")
 
         # ── tqdm Fold 진행 바 ──
@@ -369,6 +454,26 @@ class Trainer:
                         if c.startswith("te_") or c.startswith("freq_")
                     ]
                     tqdm.write(f"    TE 피처: {len(te_cols_added)}개 생성")
+
+            # ── Fold 내 시간-지연 피처 ──
+            if getattr(cfg, "use_fold_time_lag", False) and cfg.time_lag_cols:
+                y_train_np = (
+                    y_train_fold
+                    if isinstance(y_train_fold, np.ndarray)
+                    else y_train_fold.values
+                )
+                X_test_for_tl = X_test_fold if X_test_fold is not None else X_test
+                X_train_fold, X_val_fold, X_test_fold = compute_fold_time_lag_features(
+                    X_train_fold,
+                    y_train_np,
+                    X_val_fold,
+                    X_test_for_tl,
+                    time_col="계약년월",
+                    lag_cols=cfg.time_lag_cols,
+                    recent_months=getattr(cfg, "time_lag_recent_months", 24),
+                )
+                if fold_idx == 1:
+                    tqdm.write(f"    시간-지연 피처: {cfg.time_lag_cols}")
 
             # ── Sample Weight ──
             weights = None

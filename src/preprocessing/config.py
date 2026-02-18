@@ -123,6 +123,24 @@ class PreprocessingConfig:
     hdbscan_min_cluster_size: int = 10
     hdbscan_min_samples: int | None = None
 
+    # ── 다중공선성 제거 (GAMMA_PROMPT Step 3) ──
+    multicollinearity_drop_cols: list[str] = field(
+        default_factory=lambda: [
+            "k-연면적",  # 주거전용면적과 상관계수 0.98 → 설명력 낮은 쪽 제거
+        ]
+    )
+
+    # ── 주차대수 RF 예측 피처 (GAMMA_PROMPT Step 10) ──
+    parking_prediction_features: list[str] = field(
+        default_factory=lambda: [
+            "전용면적", "k-전체세대수", "k-전체동수", "건물나이", "층",
+        ]
+    )
+
+    # ── Label Encoding 대상 (GAMMA_PROMPT Step 14) ──
+    # 빈 리스트면 자동 감지 (object dtype + 고유값 20 미만)
+    label_encode_cols: list[str] = field(default_factory=list)
+
     # ── 저중요도 피처 제거 ──
     low_importance_cols: list[str] = field(
         default_factory=lambda: [
@@ -130,11 +148,13 @@ class PreprocessingConfig:
             "k-단지분류_아파트_주상복합등등_", "사용허가여부",
             "청소비관리형태", "기타/의무/임대/임의_1/2/3/4",
             "세대전기계약방법", "k-관리방식", "k-복도유형",
+            "is_real_coord", "k-전체세대수",  # 3모델 모두 importance=0
         ]
     )
 
     # ── 시계열 피처 (Exp10) ──
-    use_timeseries_features: bool = True
+    # GAMMA_PROMPT.md 15단계에 미포함 — 기본 비활성화 (대규모 데이터에서 O(n²))
+    use_timeseries_features: bool = False
     timeseries_group_col: str = "동"  # "동" | "구" | "시군구"
 
     # ── Adversarial Validation (Exp10) ──

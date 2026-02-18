@@ -80,13 +80,20 @@ class ModelConfig:
     )
     target_encode_smoothing: int = 100
 
+    # ── Fold 내 시간-지연 피처 (아파트/동/구별 가격 추세) ──
+    use_fold_time_lag: bool = True
+    time_lag_cols: list[str] = field(
+        default_factory=lambda: ["아파트명", "동", "구"]
+    )
+    time_lag_recent_months: int = 24  # 최근 N개월 기준
+
     # ── LightGBM 하이퍼파라미터 ──
     lgbm_params: dict = field(default_factory=lambda: {
         "objective": "regression",
         "metric": "rmse",
         "boosting_type": "gbdt",
-        "n_estimators": 5000,
-        "learning_rate": 0.05,
+        "n_estimators": 10000,
+        "learning_rate": 0.03,
         "num_leaves": 63,
         "max_depth": -1,
         "min_child_samples": 20,
@@ -103,8 +110,8 @@ class ModelConfig:
     xgb_params: dict = field(default_factory=lambda: {
         "objective": "reg:squarederror",
         "eval_metric": "rmse",
-        "n_estimators": 5000,
-        "learning_rate": 0.05,
+        "n_estimators": 10000,
+        "learning_rate": 0.03,
         "max_depth": 8,
         "min_child_weight": 20,
         "subsample": 0.8,
@@ -120,8 +127,8 @@ class ModelConfig:
 
     # ── CatBoost 하이퍼파라미터 ──
     catboost_params: dict = field(default_factory=lambda: {
-        "iterations": 5000,
-        "learning_rate": 0.05,
+        "iterations": 10000,
+        "learning_rate": 0.03,
         "depth": 8,
         "l2_leaf_reg": 3.0,
         "random_strength": 0.3,
@@ -137,7 +144,7 @@ class ModelConfig:
     })
 
     # ── Early Stopping ──
-    early_stopping_rounds: int = 100
+    early_stopping_rounds: int = 200
 
     # ── 범주형 피처 (자동 감지 또는 수동 지정) ──
     categorical_features: list[str] | None = None
@@ -148,9 +155,9 @@ class ModelConfig:
         default_factory=lambda: ["lightgbm", "xgboost", "catboost"]
     )
     # 앙상블 전략: "weighted"(가중 평균) | "stacking"(2단계 메타 학습)
-    ensemble_strategy: str = "weighted"
+    ensemble_strategy: str = "stacking"
     # Multi-seed 앙상블: 같은 모델 다른 시드로 안정성 향상 (Exp10)
-    ensemble_use_multi_seed: bool = False
+    ensemble_use_multi_seed: bool = True
     ensemble_seeds: list[int] = field(
         default_factory=lambda: [42, 43, 44, 45, 46]
     )
