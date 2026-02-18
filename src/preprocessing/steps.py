@@ -944,6 +944,51 @@ class TransitFeaturesStep(PreprocessingStep):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 6.75: 한강 거리 피처 (Exp10 외부 데이터)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class HanRiverDistanceStep(PreprocessingStep):
+    """좌표 기반 한강까지 거리 근사 피처를 생성합니다 (Exp10).
+
+    서울 한강 대략적 위도 37.52°N 기준. 위도 1도 ≈ 111km.
+    dist_to_hangang_km = |위도 - 37.52| * 111 (km)
+
+    생성 피처:
+        - dist_to_hangang_km: 한강까지 거리 (km)
+    """
+
+    HANGANG_LAT = 37.52  # 서울 한강 대략적 위도
+    KM_PER_DEGREE = 111.0
+
+    @property
+    def name(self) -> str:
+        return "Step 6.75: 한강 거리"
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        if not getattr(ctx.config, "use_hangang_distance", True):
+            print("  한강 거리 비활성화 — 건너뜀")
+            return ctx
+
+        lat_col = "좌표Y"  # 한국 좌표: X=경도, Y=위도
+        if lat_col not in ctx.X_train.columns:
+            print(f"  '{lat_col}' 컬럼 없음 — 건너뜀")
+            return ctx
+
+        def _add(df: pd.DataFrame) -> pd.DataFrame:
+            df = df.copy()
+            lat = pd.to_numeric(df[lat_col], errors="coerce").fillna(self.HANGANG_LAT)
+            df["dist_to_hangang_km"] = (
+                np.abs(lat - self.HANGANG_LAT) * self.KM_PER_DEGREE
+            ).fillna(0)
+            return df
+
+        ctx.X_train = _add(ctx.X_train)
+        ctx.X_test = _add(ctx.X_test)
+        print(f"  dist_to_hangang_km: 범위 [{ctx.X_train['dist_to_hangang_km'].min():.2f}, {ctx.X_train['dist_to_hangang_km'].max():.2f}] km")
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Step 6.8: 좌표 기반 공간 클러스터링 (Exp08)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class SpatialClusteringStep(PreprocessingStep):
@@ -1766,6 +1811,125 @@ class TargetLogTransformStep(PreprocessingStep):
         y_restored = self.inverse_transform(ctx.y_train_log.values)
         max_error = np.max(np.abs(ctx.y_train.values - y_restored))
         print(f"  역변환 최대 오차: {max_error:.10f}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 8.3: Adversarial Validation 기반 피처 제거 (Exp10)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class AdversarialValidationStep(PreprocessingStep):
+    """Train/Test 구분력이 높은 피처를 제거합니다 (Exp10).
+
+    Train=1, Test=0 레이블로 분류기 학습 → 중요도 높은 피처 = 분포 차이 큼.
+    해당 피처 제거로 테스트 일반화 향상 (단, 유용한 피처까지 제거될 수 있음).
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 8.3: Adversarial Validation 기반 피처 제거"
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        cfg = ctx.config
+        if not getattr(cfg, "use_adversarial_validation", False):
+            print("  Adversarial Validation 비활성화 — 건너뜀")
+            return ctx
+
+        top_n = getattr(cfg, "adversarial_top_n_remove", 5)
+        num_cols = ctx.X_train.select_dtypes(include=[np.number]).columns.tolist()
+        if len(num_cols) < 2:
+            print("  수치형 피처 부족 — 건너뜀")
+            return ctx
+
+        X_train = ctx.X_train[num_cols].fillna(0)
+        X_test = ctx.X_test[num_cols].fillna(0)
+        X_combined = pd.concat([X_train, X_test], ignore_index=True)
+        y_source = np.array([1] * len(X_train) + [0] * len(X_test))
+
+        try:
+            import lightgbm as lgb
+        except ImportError:
+            print("  [WARN] LightGBM 없음 — 건너뜀")
+            return ctx
+
+        clf = lgb.LGBMClassifier(n_estimators=100, random_state=42, verbose=-1)
+        clf.fit(X_combined, y_source)
+        imp = pd.Series(clf.feature_importances_, index=num_cols).sort_values(ascending=False)
+        to_remove = imp.head(top_n).index.tolist()
+
+        ctx.X_train = ctx.X_train.drop(columns=to_remove, errors="ignore")
+        ctx.X_test = ctx.X_test.drop(columns=to_remove, errors="ignore")
+        ctx.categorical_cols = [c for c in ctx.categorical_cols if c not in to_remove]
+        print(f"  제거된 피처 ({len(to_remove)}개): {to_remove}")
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
+        return ctx
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Step 8.4: Feature Selection (Permutation/SHAP) (Exp10)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class FeatureSelectionStep(PreprocessingStep):
+    """Permutation Importance 또는 SHAP 기반 피처 선택 (Exp10).
+
+    상위 K개 피처만 유지하여 노이즈 감소 및 과적합 방지.
+    """
+
+    @property
+    def name(self) -> str:
+        return "Step 8.4: Feature Selection"
+
+    def execute(self, ctx: PreprocessingContext) -> PreprocessingContext:
+        cfg = ctx.config
+        if not getattr(cfg, "use_feature_selection", False):
+            print("  Feature Selection 비활성화 — 건너뜀")
+            return ctx
+
+        top_k = getattr(cfg, "feature_selection_top_k", 40)
+        method = getattr(cfg, "feature_selection_method", "permutation") or "permutation"
+
+        num_cols = ctx.X_train.select_dtypes(include=[np.number]).columns.tolist()
+        if len(num_cols) <= top_k:
+            print(f"  피처 수({len(num_cols)}) <= top_k({top_k}) — 건너뜀")
+            return ctx
+
+        X = ctx.X_train[num_cols].fillna(0)
+        y = np.log1p(ctx.y_train.values)  # 모델이 log 타겟 사용
+
+        if method == "shap":
+            try:
+                import shap
+                import lightgbm as lgb
+            except ImportError:
+                print("  [WARN] SHAP/LightGBM 없음 — permutation으로 대체")
+                method = "permutation"
+
+        if method == "permutation":
+            from sklearn.ensemble import RandomForestRegressor
+            from sklearn.inspection import permutation_importance
+
+            model = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
+            model.fit(X, y)
+            perm = permutation_importance(model, X, y, n_repeats=3, random_state=42, n_jobs=-1)
+            imp = pd.Series(perm.importances_mean, index=num_cols).sort_values(ascending=False)
+        elif method == "shap":
+            import lightgbm as lgb
+            import shap
+            model = lgb.LGBMRegressor(n_estimators=100, random_state=42, verbose=-1)
+            model.fit(X, y)
+            explainer = shap.TreeExplainer(model)
+            shap_vals = explainer.shap_values(X)
+            imp = pd.Series(np.abs(shap_vals).mean(axis=0), index=num_cols).sort_values(ascending=False)
+        else:
+            print(f"  알 수 없는 방법 '{method}' — 건너뜀")
+            return ctx
+
+        keep = imp.head(top_k).index.tolist()
+        to_remove = [c for c in num_cols if c not in keep]
+        ctx.X_train = ctx.X_train.drop(columns=to_remove, errors="ignore")
+        ctx.X_test = ctx.X_test.drop(columns=to_remove, errors="ignore")
+        ctx.categorical_cols = [c for c in ctx.categorical_cols if c not in to_remove]
+        ctx.train_stats["feature_selection_kept"] = keep
+        print(f"  {method} 상위 {top_k}개 유지, {len(to_remove)}개 제거")
+        print(f"  현재 컬럼 수: X_train={ctx.X_train.shape[1]}, X_test={ctx.X_test.shape[1]}")
         return ctx
 
 

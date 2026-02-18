@@ -137,6 +137,18 @@ class PreprocessingConfig:
     use_timeseries_features: bool = True
     timeseries_group_col: str = "동"  # "동" | "구" | "시군구"
 
+    # ── Adversarial Validation (Exp10) ──
+    use_adversarial_validation: bool = False
+    adversarial_top_n_remove: int = 5  # Train/Test 구분력 높은 상위 N개 피처 제거
+
+    # ── Feature Selection (Exp10) ──
+    use_feature_selection: bool = False
+    feature_selection_method: str = "permutation"  # "permutation" | "shap"
+    feature_selection_top_k: int = 40  # 상위 K개 피처만 유지
+
+    # ── 외부 데이터: 한강 거리 (Exp10) ──
+    use_hangang_distance: bool = True  # 좌표 기반 한강까지 거리 근사
+
     # ── Feature Diet (Exp07) ──
     # 파생 피처로 대체된 원본 컬럼을 제거하여 과적합 방지
     feature_diet_cols: list[str] = field(

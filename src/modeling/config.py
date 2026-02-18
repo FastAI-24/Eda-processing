@@ -155,6 +155,15 @@ class ModelConfig:
         default_factory=lambda: [42, 43, 44, 45, 46]
     )
 
+    # ── Pseudo Labeling (Exp10) ──
+    use_pseudo_labeling: bool = False
+    pseudo_label_ratio: float = 0.1  # 상위 신뢰도 비율만 pseudo로 추가
+    pseudo_label_rounds: int = 1    # 반복 라운드 (1=1회만)
+
+    # ── Quantile Regression (Exp10) ──
+    use_quantile_regression: bool = False
+    quantile_alpha: float = 0.5  # 0.5=중앙값
+
     # ── 튜닝 파라미터 자동 적용 ──
 
     def apply_tuned_params(self, params_path: Path | str | None = None) -> bool:

@@ -28,7 +28,7 @@ from tqdm import tqdm
 
 from .base import TrainingResult
 from .config import ModelConfig
-from .models import CatBoostModel, LightGBMModel, XGBoostModel
+from .models import CatBoostModel, LightGBMModel, LightGBMQuantileModel, MLPModel, XGBoostModel
 from .trainer import Trainer
 
 
@@ -37,8 +37,10 @@ class EnsembleTrainer:
 
     MODEL_MAP = {
         "lightgbm": LightGBMModel,
+        "lightgbm_quantile": LightGBMQuantileModel,
         "xgboost": XGBoostModel,
         "catboost": CatBoostModel,
+        "mlp": MLPModel,
     }
 
     def __init__(self, config: ModelConfig | None = None) -> None:
