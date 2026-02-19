@@ -84,6 +84,23 @@ graph LR
 | **단지 부가(k- 접두사)** | k-관리방식, k-난방방식, k-복도유형, k-전체세대수 등 | 60~80% 결측 |
 | **고결측 컬럼**          | 해제사유발생일, 등기신청일자, 단지소개 등           | 80~99% 결측 |
 
+### 2.4 EDA 시각화 (`assets/eda_output/`)
+
+EDA 산출 이미지는 `assets/eda_output/`에 위치합니다. (GitHub에서 정상 표시)
+
+| 파일 | 내용 |
+| --- | --- |
+| `target_distribution.png` | 타겟(실거래가) 분포 (Right-skewed) |
+| `log_target_distribution.png` | log1p 변환 후 분포 |
+| `correlation_matrix.png` | 수치형 변수 상관행렬 |
+| `top_numeric_correlations.png` | 타겟과 상위 상관계수 |
+| `deleted_columns_viz_summary.png` | 제거 컬럼 26개 시각화 |
+| `cancelled_transactions_price_boxplot.png` | 취소 거래 가격 분포 |
+| `parking_info_price_impact.png` | 주차대수·가격 영향 |
+| `cat_k-난방방식.png` | 범주형 k-난방방식 분포 |
+| `cat_k-단지분류(아파트,주상복합등등).png` | 범주형 k-단지분류 분포 |
+| `outliers/coordinate_outliers_map.png` | 좌표 이상치 지도 |
+
 ---
 
 ## 3. EDA 핵심 발견 → 전처리 전략
@@ -106,7 +123,17 @@ graph LR
 | `k-관리비`       | 1,095,167 | **97.9%** |
 | `k-전화번호`     | 1,091,234 | **97.5%** |
 
-### 3.3 상관관계 분석
+### 3.3 타겟 분포 및 상관관계
+
+![타겟 분포](assets/eda_output/target_distribution.png)
+
+![로그 변환 후 타겟 분포](assets/eda_output/log_target_distribution.png)
+
+> 타겟이 Right-skewed → log1p 변환 시 왜도 2.3 → 0.4로 개선
+
+![상관행렬](assets/eda_output/correlation_matrix.png)
+
+![상위 상관계수](assets/eda_output/top_numeric_correlations.png)
 
 **상위 양의 상관관계**: `전용면적(㎡)` **0.577** > 주차대수 0.348 > 계약년월 0.345 > k-연면적 0.344 …
 
@@ -114,12 +141,16 @@ graph LR
 
 **컬럼 제거 기준**: 결측률 ≥80% / 예측 무관 메타데이터 / 다중공선성(k-연면적 vs k-주거전용면적 0.98) → **최종 26개 제거**
 
+![제거 컬럼 시각화](assets/eda_output/deleted_columns_viz_summary.png)
+
 ### 3.4 좌표 이상치 (Critical)
 
 **서울시 정상 범위**: 경도(X) 126.7~127.3, 위도(Y) 37.4~37.7
 
 - **원인**: API가 동명 오류로 서울이 아닌 타 지역(예: 전북 익산 삼성동) 반환
 - **조치**: 이상치 → NaN 변환 후, 해당 법정동 정상 데이터 **중앙값**으로 대체
+
+![좌표 이상치 지도](assets/eda_output/outliers/coordinate_outliers_map.png)
 
 ### 3.5 EDA → 전처리 전략 매핑
 
@@ -175,6 +206,8 @@ graph LR
 ```
 
 ### Step 0. 취소 거래 필터링
+
+![취소 거래 가격 분포](assets/eda_output/cancelled_transactions_price_boxplot.png)
 
 | 데이터     | 행 제거 | 컬럼 제거 | 이유                                   |
 | ---------- | :-----: | :-------: | -------------------------------------- |
@@ -243,6 +276,8 @@ graph LR
 | dtype == object                      | 시군구, 아파트명, k-관리방식 등     |
 | 고유값 비율 < 10% AND 고유값 < 100개 | 숫자형이지만 실질적으로 범주인 컬럼 |
 
+![k-단지분류](assets/eda_output/cat_k-단지분류(아파트,주상복합등등).png) ![k-난방방식](assets/eda_output/cat_k-난방방식.png)
+
 ### Step 5. 결측 지표 피처
 
 ```python
@@ -291,6 +326,8 @@ X["missing_count"] = X.isnull().sum(axis=1)
 **학습 변수**: `전용면적(㎡)`, `건축년도`, `좌표X`, `좌표Y`, `Gu_encoded`, `전체세대수`
 
 **Feature Importance**: 전용면적 45.2% > 전체세대수 28.7% > 건축년도 12.3% > 좌표 9.8%
+
+![주차대수·가격 영향](assets/eda_output/parking_info_price_impact.png)
 
 ### Step 6.7. 교통 피처 — BallTree 기반 (Exp05)
 
